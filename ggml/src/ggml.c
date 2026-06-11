@@ -1079,9 +1079,11 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "OPT_STEP_SGD",
 
     "GLU",
+
+    "PENALTIES",
 };
 
-static_assert(GGML_OP_COUNT == 97, "GGML_OP_COUNT != 97");
+static_assert(GGML_OP_COUNT == 98, "GGML_OP_COUNT != 98");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1190,9 +1192,11 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "sgd(x)",
 
     "glu(x)",
+
+    "penalties(logits)",
 };
 
-static_assert(GGML_OP_COUNT == 97, "GGML_OP_COUNT != 97");
+static_assert(GGML_OP_COUNT == 98, "GGML_OP_COUNT != 98");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -5335,6 +5339,39 @@ struct ggml_tensor * ggml_top_k(
 
     result->op     = GGML_OP_TOP_K;
     result->src[0] = a;
+
+    return result;
+}
+
+// ggml_penalties
+
+struct ggml_tensor * ggml_penalties(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * logits,
+        struct ggml_tensor  * token_ids,
+        struct ggml_tensor  * counts,
+        struct ggml_tensor  * n_active,
+        float                 penalty_repeat,
+        float                 penalty_freq,
+        float                 penalty_present) {
+    GGML_ASSERT(logits->type == GGML_TYPE_F32);
+    GGML_ASSERT(token_ids->type == GGML_TYPE_I32);
+    GGML_ASSERT(counts->type == GGML_TYPE_I32);
+    GGML_ASSERT(n_active->type == GGML_TYPE_I32);
+    GGML_ASSERT(ggml_is_contiguous(logits));
+    GGML_ASSERT(token_ids->ne[0] == counts->ne[0]);
+
+    struct ggml_tensor * result = ggml_view_tensor(ctx, logits);
+
+    ggml_set_op_params_f32(result, 0, penalty_repeat);
+    ggml_set_op_params_f32(result, 1, penalty_freq);
+    ggml_set_op_params_f32(result, 2, penalty_present);
+
+    result->op     = GGML_OP_PENALTIES;
+    result->src[0] = logits;
+    result->src[1] = token_ids;
+    result->src[2] = counts;
+    result->src[3] = n_active;
 
     return result;
 }

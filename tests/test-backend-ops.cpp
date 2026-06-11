@@ -5705,6 +5705,90 @@ struct test_top_k : public test_case {
     }
 };
 
+// GGML_OP_PENALTIES
+struct test_penalties : public test_case {
+    const int64_t vocab;
+    const int64_t n_max;
+    const float penalty_repeat;
+    const float penalty_freq;
+    const float penalty_present;
+    const std::vector<int32_t> tokens;
+    const std::vector<int32_t> counts;
+
+    ggml_tensor * logits     = nullptr;
+    ggml_tensor * ids        = nullptr;
+    ggml_tensor * cnts       = nullptr;
+    ggml_tensor * n_active_t = nullptr;
+
+    std::string vars() override {
+        std::ostringstream ss;
+        ss << vocab << "_" << n_max << "_" << penalty_repeat << "_" << penalty_freq << "_" << penalty_present;
+        ss << "_" << tokens.size();
+        return ss.str();
+    }
+
+    test_penalties(
+            int64_t vocab,
+            int64_t n_max,
+            float penalty_repeat,
+            float penalty_freq,
+            float penalty_present,
+            std::vector<int32_t> tokens,
+            std::vector<int32_t> counts)
+        : vocab(vocab)
+        , n_max(n_max)
+        , penalty_repeat(penalty_repeat)
+        , penalty_freq(penalty_freq)
+        , penalty_present(penalty_present)
+        , tokens(std::move(tokens))
+        , counts(std::move(counts)) {
+        GGML_ASSERT(this->tokens.size() == this->counts.size());
+        GGML_ASSERT((int64_t) this->tokens.size() <= n_max);
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        logits = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, vocab);
+        ggml_set_name(logits, "logits");
+
+        ids = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_max);
+        ggml_set_name(ids, "pen_ids");
+
+        cnts = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_max);
+        ggml_set_name(cnts, "pen_cnts");
+
+        n_active_t = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 1);
+        ggml_set_name(n_active_t, "pen_n_active");
+
+        ggml_tensor * out = ggml_penalties(
+                ctx, logits, ids, cnts, n_active_t,
+                penalty_repeat, penalty_freq, penalty_present);
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        GGML_UNUSED(ctx);
+
+        std::vector<float> logits_data(vocab, std::log(0.2f));
+        ggml_backend_tensor_set(logits, logits_data.data(), 0, vocab * sizeof(float));
+
+        const int32_t n_active = (int32_t) tokens.size();
+
+        std::vector<int32_t> ids_data(n_max, 0);
+        std::vector<int32_t> cnt_data(n_max, 0);
+        for (int32_t i = 0; i < n_active; ++i) {
+            ids_data[i] = tokens[i];
+            cnt_data[i] = counts[i];
+        }
+
+        ggml_backend_tensor_set(ids,        ids_data.data(), 0, n_max * sizeof(int32_t));
+        ggml_backend_tensor_set(cnts,       cnt_data.data(), 0, n_max * sizeof(int32_t));
+        ggml_backend_tensor_set(n_active_t, &n_active,       0, sizeof(int32_t));
+    }
+};
+
 enum MoeGatingFunc {
     GATING_FUNC_SOFTMAX,
     GATING_FUNC_SIGMOID,
@@ -8901,6 +8985,37 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     //for (int i = 1; i < 9999; ++i) {
     //    test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {i, 2, 1, 3}, rand() % i + 1));
     //}
+
+    test_cases.emplace_back(new test_penalties(
+        32, 32, 50.0f, 0.0f, 0.0f, {0}, {1}));
+    test_cases.emplace_back(new test_penalties(
+        32, 32, 50.0f, 0.0f, 0.0f, {0, 1, 2}, {1, 1, 1}));
+    test_cases.emplace_back(new test_penalties(
+        32, 32, 1.0f, 5.0f, 5.0f, {0, 1, 2}, {3, 1, 1}));
+    {
+        std::vector<int32_t> tokens;
+        std::vector<int32_t> counts;
+        tokens.reserve(8192);
+        counts.reserve(8192);
+        for (int32_t i = 0; i < 8192; ++i) {
+            tokens.push_back(i);
+            counts.push_back(1);
+        }
+        test_cases.emplace_back(new test_penalties(
+            8192, 8192, 1.1f, 0.3f, 0.5f, std::move(tokens), std::move(counts)));
+    }
+    {
+        std::vector<int32_t> tokens;
+        std::vector<int32_t> counts;
+        tokens.reserve(32768);
+        counts.reserve(32768);
+        for (int32_t i = 0; i < 32768; ++i) {
+            tokens.push_back(i);
+            counts.push_back(1 + (i % 3));
+        }
+        test_cases.emplace_back(new test_penalties(
+            32768, 32768, 1.2f, 0.1f, 0.2f, std::move(tokens), std::move(counts)));
+    }
 
     for (ggml_scale_mode mode : {GGML_SCALE_MODE_NEAREST, GGML_SCALE_MODE_BILINEAR, GGML_SCALE_MODE_BICUBIC, ggml_scale_mode(GGML_SCALE_MODE_BILINEAR | GGML_SCALE_FLAG_ANTIALIAS)}) {
         test_cases.emplace_back(new test_upscale(GGML_TYPE_F32, {512, 512, 3, 2}, 2, mode));

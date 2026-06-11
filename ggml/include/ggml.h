@@ -584,6 +584,8 @@ extern "C" {
 
         GGML_OP_GLU,
 
+        GGML_OP_PENALTIES,
+
         GGML_OP_COUNT,
     };
 
@@ -2388,6 +2390,21 @@ extern "C" {
             struct ggml_context * ctx,
             struct ggml_tensor  * a,
             int                   k);
+
+    // apply repeat / frequency / presence penalties to logits (in-place)
+    // logits:    [n_vocab]
+    // token_ids: [n_max] input, only the first n_active entries are used
+    // counts:    [n_max] input, penalty count per token id
+    // n_active:  [1]     input, number of valid entries in token_ids/counts
+    GGML_API struct ggml_tensor * ggml_penalties(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * logits,
+            struct ggml_tensor  * token_ids,
+            struct ggml_tensor  * counts,
+            struct ggml_tensor  * n_active,
+            float                 penalty_repeat,
+            float                 penalty_freq,
+            float                 penalty_present);
 
     GGML_API struct ggml_tensor * ggml_arange(
             struct ggml_context * ctx,

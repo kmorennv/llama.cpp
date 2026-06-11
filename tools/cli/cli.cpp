@@ -9,6 +9,8 @@
 #include "server-context.h"
 #include "server-task.h"
 
+#include "ggml-nvtx.h"
+
 #include <array>
 #include <atomic>
 #include <algorithm>
@@ -358,6 +360,10 @@ static constexpr size_t FILE_GLOB_MAX_RESULTS = 100;
 int llama_cli(int argc, char ** argv);
 
 int llama_cli(int argc, char ** argv) {
+#ifdef GGML_NVTX
+    ggml_nvtx_range nvtx_session("llama-cli", GGML_NVTX_COLOR_PP);
+#endif
+
     common_params params;
 
     params.verbosity = LOG_LEVEL_ERROR; // by default, less verbose logs
@@ -417,6 +423,10 @@ int llama_cli(int argc, char ** argv) {
     std::thread inference_thread([&ctx_cli]() {
         ctx_cli.ctx_server.start_loop();
     });
+
+#ifdef GGML_NVTX
+    ggml_nvtx_range nvtx_ready("llama-cli-ready", GGML_NVTX_COLOR_PP);
+#endif
 
     auto inf = ctx_cli.ctx_server.get_meta();
     std::string modalities = "text";

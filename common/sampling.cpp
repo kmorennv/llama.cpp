@@ -6,6 +6,7 @@
 #include "reasoning-budget.h"
 
 #include "ggml.h"
+#include "ggml-nvtx.h"
 
 #include <algorithm>
 #include <cctype>
@@ -186,6 +187,12 @@ std::string common_params_sampling::print() const {
 
 struct common_sampler * common_sampler_init(const struct llama_model * model, struct common_params_sampling & params) {
     const llama_vocab * vocab = llama_model_get_vocab(model);
+
+    if (params.penalty_last_n == -1) {
+        params.penalty_last_n = llama_model_n_ctx_train(model);
+    }
+    params.penalty_last_n = std::max(params.penalty_last_n, 0);
+    params.n_prev = std::max(params.n_prev, params.penalty_last_n);
 
     llama_sampler_chain_params lparams = llama_sampler_chain_default_params();
 
@@ -571,6 +578,10 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
         }
     }
 
+#ifdef GGML_NVTX
+    ggml_nvtx_mark("cpu_sampler_begin", GGML_NVTX_COLOR_SAMPLER_CPU);
+#endif
+
     // apply reasoning budget first
     llama_sampler_apply(rbudget, &cur_p);
 
@@ -583,6 +594,9 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
     id = cur_p.data[cur_p.selected].id;
 
     if (grammar_first || !grammar_should_apply(gsmpl)) {
+#ifdef GGML_NVTX
+        ggml_nvtx_mark("cpu_sampler_end", GGML_NVTX_COLOR_SAMPLER_CPU);
+#endif
         return id;
     }
 
@@ -614,6 +628,10 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
     GGML_ASSERT(cur_p.selected != -1 && "no selected token during sampling - check your sampling configuration");
 
     id = cur_p.data[cur_p.selected].id;
+
+#ifdef GGML_NVTX
+    ggml_nvtx_mark("cpu_sampler_end", GGML_NVTX_COLOR_SAMPLER_CPU);
+#endif
 
     return id;
 }

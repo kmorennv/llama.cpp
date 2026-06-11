@@ -208,6 +208,25 @@ add_library(ggml-base
             ggml-quants.h
             gguf.cpp)
 
+if (GGML_NVTX)
+    if (NOT GGML_CUDA)
+        message(FATAL_ERROR "GGML_NVTX requires GGML_CUDA")
+    endif()
+
+    find_package(CUDAToolkit REQUIRED)
+
+    target_compile_definitions(ggml-base PUBLIC GGML_NVTX)
+    target_sources(ggml-base PRIVATE ggml-nvtx.cpp)
+
+    if (TARGET CUDA::nvtx3)
+        target_link_libraries(ggml-base PUBLIC CUDA::nvtx3)
+    else ()
+        target_include_directories(ggml-base PUBLIC ${CUDAToolkit_INCLUDE_DIRS})
+    endif ()
+
+    message(STATUS "GGML_NVTX enabled (nvtx3 via ggml-base)")
+endif ()
+
 set_target_properties(ggml-base PROPERTIES
     VERSION ${GGML_VERSION}
     SOVERSION ${GGML_VERSION_MAJOR}

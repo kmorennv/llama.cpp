@@ -16,6 +16,7 @@
 #include "mtmd-helper.h"
 
 #include "ggml-cpp.h"
+#include "ggml-nvtx.h"
 
 // TODO: tmp until the mtmd draft processing is refactored [TAG_MTMD_DRAFT_PROCESSING]
 #include "../../src/llama-ext.h"
@@ -206,6 +207,10 @@ struct server_slot {
     int32_t n_draft_total = 0;      // Total draft tokens generated
     int32_t n_draft_accepted = 0;   // Draft tokens actually accepted
 
+#ifdef GGML_NVTX
+    std::unique_ptr<ggml_nvtx_range> nvtx_session;
+#endif
+
     void reset() {
         SLT_DBG(*this, "%s", "\n");
 
@@ -231,6 +236,10 @@ struct server_slot {
         // clear speculative decoding stats
         n_draft_total = 0;
         n_draft_accepted = 0;
+
+#ifdef GGML_NVTX
+        nvtx_session.reset();
+#endif
 
         task_prev = std::move(task);
         task.reset();
@@ -388,6 +397,10 @@ struct server_slot {
 
             t_last_used        =  ggml_time_us();
             t_token_generation = (ggml_time_us() - t_start_generation) / 1e3;
+
+#ifdef GGML_NVTX
+            nvtx_session.reset();
+#endif
 
             state = SLOT_STATE_IDLE;
 
@@ -2644,6 +2657,11 @@ private:
 
                         slot.state = SLOT_STATE_PROCESSING_PROMPT;
 
+#ifdef GGML_NVTX
+                        slot.nvtx_session = std::make_unique<ggml_nvtx_range>(
+                            "server_prefill", GGML_NVTX_COLOR_SESSION_PP);
+#endif
+
                         SLT_TRC(slot, "new prompt, n_ctx_slot = %d, n_keep = %d, task.n_tokens = %d\n",
                                 slot.n_ctx, slot.task->params.n_keep, slot.task->n_tokens());
 
@@ -3078,6 +3096,10 @@ private:
                     if (slot.prompt.n_tokens() == slot.task->n_tokens()) {
                         slot.state = SLOT_STATE_DONE_PROMPT;
 
+#ifdef GGML_NVTX
+                        slot.nvtx_session.reset();
+#endif
+
                         GGML_ASSERT(batch.n_tokens > 0);
 
                         // extract the logits only for the last token
@@ -3363,6 +3385,11 @@ private:
 
                     // prompt evaluated for next-token prediction
                     slot.state = SLOT_STATE_GENERATING;
+
+#ifdef GGML_NVTX
+                    slot.nvtx_session = std::make_unique<ggml_nvtx_range>(
+                        "server_decode", GGML_NVTX_COLOR_SESSION_TG);
+#endif
 
                     if (slot.can_speculate()) {
                         common_speculative_begin(spec.get(), slot.id, slot.prompt.tokens.get_text_tokens());

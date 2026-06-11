@@ -11,6 +11,7 @@
 #include "llama-model.h"
 
 #include "ggml.h"
+#include "ggml-nvtx.h"
 #include "ggml-cpp.h"
 #include "ggml-backend.h"
 #include "gguf.h"
@@ -87,6 +88,11 @@ bool llama_supports_rpc(void) {
 }
 
 void llama_backend_init(void) {
+#ifdef GGML_NVTX
+    ggml_nvtx_init();
+    ggml_nvtx_self_test();
+#endif
+
     ggml_time_init();
 
     // needed to initialize f16 tables

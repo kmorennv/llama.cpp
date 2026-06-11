@@ -1,6 +1,7 @@
 #include "llama-context.h"
 
 #include "ggml.h"
+#include "ggml-nvtx.h"
 #include "llama-arch.h"
 #include "llama-graph.h"
 #include "llama-impl.h"
@@ -14,6 +15,7 @@
 
 #include <cinttypes>
 #include <cmath>
+#include <cstdio>
 #include <cstring>
 #include <limits>
 #include <stdexcept>
@@ -21,6 +23,20 @@
 //
 // llama_context
 //
+
+#ifdef GGML_NVTX
+struct llama_decode_nvtx_guard {
+    llama_context   * ctx;
+    ggml_nvtx_range   range;
+
+    llama_decode_nvtx_guard(llama_context * ctx, const char * name, uint32_t color)
+        : ctx(ctx), range(name, color) {}
+
+    ~llama_decode_nvtx_guard() {
+        ctx->synchronize();
+    }
+};
+#endif
 
 static llm_graph_type ctx_type_to_graph_type(llama_context_type ctx_type) {
     switch (ctx_type) {
@@ -1339,6 +1355,10 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 }
 
 int llama_context::encode(const llama_batch & batch_inp) {
+#ifdef GGML_NVTX
+    llama_decode_nvtx_guard nvtx_guard(this, "llama_encode", GGML_NVTX_COLOR_PP);
+#endif
+
     // MTP hook batches carry both token (next-token id) and embd (h_nextn row),
     // so accept either present rather than requiring exactly one.
     GGML_ASSERT(batch_inp.token || batch_inp.embd);
@@ -1642,6 +1662,13 @@ static bool needs_raw_logits(const llama_ubatch & ubatch, const std::map<llama_s
 }
 
 int llama_context::decode(const llama_batch & batch_inp) {
+#ifdef GGML_NVTX
+    const bool is_pp = batch_inp.n_tokens > 1;
+    llama_decode_nvtx_guard nvtx_guard(
+        this, is_pp ? "llama_pp" : "llama_tg",
+        is_pp ? GGML_NVTX_COLOR_PP : GGML_NVTX_COLOR_TG);
+#endif
+
     // MTP hook batches carry both token (next-token id) and embd (h_nextn row),
     // so accept either present rather than requiring exactly one.
     GGML_ASSERT(batch_inp.token || batch_inp.embd);
@@ -2326,6 +2353,12 @@ llm_graph_params llama_context::graph_params(
 ggml_status llama_context::graph_compute(
             ggml_cgraph * gf,
                    bool   batched) {
+#ifdef GGML_NVTX
+    const ggml_nvtx_range nvtx(
+        batched ? "llama_graph_pp" : "llama_graph_tg",
+        batched ? GGML_NVTX_COLOR_PP : GGML_NVTX_COLOR_TG);
+#endif
+
     int n_threads        = batched ? cparams.n_threads_batch : cparams.n_threads;
     ggml_threadpool_t tp = batched ? threadpool_batch        : threadpool;
 
@@ -2342,10 +2375,24 @@ ggml_status llama_context::graph_compute(
         set_n_threads_fn.second(set_n_threads_fn.first, n_threads);
     }
 
+#ifdef GGML_NVTX
+    const bool nvtx_backend_samplers = !sampling.samplers.empty();
+    if (nvtx_backend_samplers) {
+        ggml_nvtx_mark("backend_sampler_begin", GGML_NVTX_COLOR_SAMPLER_BACKEND);
+    }
+#endif
+
     auto status = ggml_backend_sched_graph_compute_async(sched.get(), gf);
     if (status != GGML_STATUS_SUCCESS) {
         LLAMA_LOG_ERROR("%s: ggml_backend_sched_graph_compute_async failed with error %d\n", __func__, status);
     }
+
+#ifdef GGML_NVTX
+    ggml_backend_sched_synchronize(sched.get());
+    if (nvtx_backend_samplers) {
+        ggml_nvtx_mark("backend_sampler_end", GGML_NVTX_COLOR_SAMPLER_BACKEND);
+    }
+#endif
 
     // fprintf(stderr, "splits: %d\n", ggml_backend_sched_get_n_splits(sched));
 

@@ -1,5 +1,7 @@
 #include "llama-sampler.h"
 
+#include "ggml-nvtx.h"
+
 #include "llama-impl.h"
 #include "llama-vocab.h"
 #include "llama-grammar.h"
@@ -9,6 +11,7 @@
 #include <array>
 #include <algorithm>
 #include <cassert>
+#include <cstdio>
 #include <cfloat>
 #include <chrono>
 #include <cmath>
@@ -365,6 +368,18 @@ const char * llama_sampler_name(const struct llama_sampler * smpl) {
     return smpl->iface->name(smpl);
 }
 
+#ifdef GGML_NVTX
+static void llama_nvtx_sampler_mark(
+        const char * prefix,
+        const char * phase,
+        const struct llama_sampler * smpl,
+        uint32_t color) {
+    char buf[96];
+    snprintf(buf, sizeof(buf), "%s%s_%s", prefix, llama_sampler_name(smpl), phase);
+    ggml_nvtx_mark(buf, color);
+}
+#endif
+
 void llama_sampler_accept(struct llama_sampler * smpl, llama_token token) {
     if (!smpl) {
         return;
@@ -379,9 +394,27 @@ void llama_sampler_apply(struct llama_sampler * smpl, struct llama_token_data_ar
     if (!smpl) {
         return;
     }
-
+    const int64_t t0 = ggml_time_us();
     GGML_ASSERT(smpl->iface->apply);
+
+#ifdef GGML_NVTX
+    const bool nvtx_leaf = strcmp(llama_sampler_name(smpl), "chain") != 0;
+    if (nvtx_leaf) {
+        llama_nvtx_sampler_mark("cpu_sampler:", "begin", smpl, GGML_NVTX_COLOR_SAMPLER_CPU);
+    }
+#endif
+
     smpl->iface->apply(smpl, cur_p);
+
+#ifdef GGML_NVTX
+    if (nvtx_leaf) {
+        llama_nvtx_sampler_mark("cpu_sampler:", "end", smpl, GGML_NVTX_COLOR_SAMPLER_CPU);
+    }
+#endif
+
+    const int64_t elapsed_us = ggml_time_us() - t0;
+    // if(elapsed_us>0)
+    //      LLAMA_LOG_INFO("%s: sampler '%s' applied in %d us\n", __func__, llama_sampler_name(smpl), (int)(elapsed_us ));
 }
 
 void llama_sampler_reset(struct llama_sampler * smpl) {
@@ -757,7 +790,13 @@ static void llama_sampler_chain_backend_apply(
         }
 
         if (smpl.ptr->iface->backend_apply) {
+#ifdef GGML_NVTX
+            llama_nvtx_sampler_mark("backend_sampler:", "begin", smpl.ptr, GGML_NVTX_COLOR_SAMPLER_BACKEND);
+#endif
             smpl.ptr->iface->backend_apply(smpl.ptr, ctx, gf, data);
+#ifdef GGML_NVTX
+            llama_nvtx_sampler_mark("backend_sampler:", "end", smpl.ptr, GGML_NVTX_COLOR_SAMPLER_BACKEND);
+#endif
         }
     }
 }
@@ -771,7 +810,13 @@ static void llama_sampler_chain_backend_set_input(struct llama_sampler * smpl) {
         }
 
         if (smpl.ptr->iface->backend_set_input) {
+#ifdef GGML_NVTX
+            llama_nvtx_sampler_mark("backend_sampler:", "begin", smpl.ptr, GGML_NVTX_COLOR_SAMPLER_BACKEND);
+#endif
             smpl.ptr->iface->backend_set_input(smpl.ptr);
+#ifdef GGML_NVTX
+            llama_nvtx_sampler_mark("backend_sampler:", "end", smpl.ptr, GGML_NVTX_COLOR_SAMPLER_BACKEND);
+#endif
         }
     }
 }
@@ -861,7 +906,15 @@ llama_token llama_sampler_sample(struct llama_sampler * smpl, struct llama_conte
         /* .sorted     = */ false,
     };
 
+#ifdef GGML_NVTX
+    ggml_nvtx_mark("cpu_sampler_begin", GGML_NVTX_COLOR_SAMPLER_CPU);
+#endif
+
     llama_sampler_apply(smpl, &cur_p);
+
+#ifdef GGML_NVTX
+    ggml_nvtx_mark("cpu_sampler_end", GGML_NVTX_COLOR_SAMPLER_CPU);
+#endif
 
     GGML_ASSERT(cur_p.selected >= 0 && cur_p.selected < (int32_t) cur_p.size);
 
@@ -2619,7 +2672,7 @@ struct llama_sampler * llama_sampler_init_grammar_lazy_patterns(
 
 // penalties
 
-struct llama_sampler_penalties {
+struct llama_sampler_penalties : public llama_sampler_backend {
     const int32_t penalty_last_n;
     const float   penalty_repeat;
     const float   penalty_freq;
@@ -2629,10 +2682,33 @@ struct llama_sampler_penalties {
 
     // a frequency map to count token occurrences
     std::unordered_map<llama_token, int> token_count;
+
+    ggml_tensor * inp_token_ids = nullptr;
+    ggml_tensor * inp_counts    = nullptr;
+    ggml_tensor * inp_n_active  = nullptr;
+
+    std::vector<int32_t> host_token_ids;
+    std::vector<int32_t> host_counts;
+
+    llama_sampler_penalties(
+            int32_t penalty_last_n,
+            float   penalty_repeat,
+            float   penalty_freq,
+            float   penalty_present)
+        : llama_sampler_backend("penalties")
+        , penalty_last_n  (penalty_last_n)
+        , penalty_repeat  (penalty_repeat)
+        , penalty_freq    (penalty_freq)
+        , penalty_present (penalty_present)
+        , prev            (penalty_last_n)
+        , host_token_ids  (penalty_last_n, 0)
+        , host_counts     (penalty_last_n, 0) {
+    }
 };
 
-static const char * llama_sampler_penalties_name(const struct llama_sampler * /*smpl*/) {
-    return "penalties";
+static const char * llama_sampler_penalties_name(const struct llama_sampler * smpl) {
+    auto * ctx = (llama_sampler_penalties *) smpl->ctx;
+    return ctx->get_name();
 }
 
 static void llama_sampler_penalties_accept(struct llama_sampler * smpl, llama_token token) {
@@ -2717,7 +2793,8 @@ static struct llama_sampler * llama_sampler_penalties_clone(const struct llama_s
     {
         auto * result_ctx = (llama_sampler_penalties *) result->ctx;
 
-        result_ctx->prev = ctx->prev;
+        result_ctx->prev         = ctx->prev;
+        result_ctx->token_count  = ctx->token_count;
     }
 
     return result;
@@ -2727,6 +2804,95 @@ static void llama_sampler_penalties_free(struct llama_sampler * smpl) {
     delete (llama_sampler_penalties *) smpl->ctx;
 }
 
+static bool llama_sampler_penalties_backend_init(
+        struct llama_sampler       * smpl,
+        ggml_backend_buffer_type_t   buft) {
+    auto * sctx = (llama_sampler_penalties *) smpl->ctx;
+
+    const bool res = llama_sampler_backend_support(smpl, buft);
+
+    sctx->init(res);
+
+    return res;
+}
+
+static void llama_sampler_penalties_backend_apply(
+        struct llama_sampler      * smpl,
+        struct ggml_context       * ctx,
+        struct ggml_cgraph        * gf,
+        struct llama_sampler_data * data) {
+    GGML_UNUSED(gf);
+
+    auto * sctx = (llama_sampler_penalties *) smpl->ctx;
+
+    if ((sctx->penalty_last_n == 0) ||
+        (sctx->penalty_repeat == 1.0f && sctx->penalty_freq == 0.0f && sctx->penalty_present == 0.0f)) {
+        return;
+    }
+
+    sctx->inp_token_ids = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, sctx->penalty_last_n);
+    ggml_set_name(sctx->inp_token_ids, "penalties_token_ids");
+    ggml_set_input(sctx->inp_token_ids);
+
+    sctx->inp_counts = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, sctx->penalty_last_n);
+    ggml_set_name(sctx->inp_counts, "penalties_counts");
+    ggml_set_input(sctx->inp_counts);
+
+    sctx->inp_n_active = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 1);
+    ggml_set_name(sctx->inp_n_active, "penalties_n_active");
+    ggml_set_input(sctx->inp_n_active);
+
+    data->logits = ggml_penalties(
+            ctx,
+            data->logits,
+            sctx->inp_token_ids,
+            sctx->inp_counts,
+            sctx->inp_n_active,
+            sctx->penalty_repeat,
+            sctx->penalty_freq,
+            sctx->penalty_present);
+    ggml_set_name(data->logits, "penalties_logits");
+}
+
+static void llama_sampler_penalties_backend_set_input(struct llama_sampler * smpl) {
+    auto * sctx = (llama_sampler_penalties *) smpl->ctx;
+
+    if (!sctx->inp_token_ids || !sctx->inp_counts || !sctx->inp_n_active) {
+        return;
+    }
+
+    if ((sctx->penalty_last_n == 0) ||
+        (sctx->penalty_repeat == 1.0f && sctx->penalty_freq == 0.0f && sctx->penalty_present == 0.0f)) {
+        return;
+    }
+
+    int32_t n_active = 0;
+
+    for (const auto & it : sctx->token_count) {
+        GGML_ASSERT(n_active < sctx->penalty_last_n);
+        sctx->host_token_ids[n_active] = it.first;
+        sctx->host_counts   [n_active] = it.second;
+        ++n_active;
+    }
+
+    std::vector<std::pair<int32_t, int32_t>> entries;
+    entries.reserve(n_active);
+    for (int32_t i = 0; i < n_active; ++i) {
+        entries.emplace_back(sctx->host_token_ids[i], sctx->host_counts[i]);
+    }
+    std::sort(entries.begin(), entries.end(), [](const auto & a, const auto & b) {
+        return a.first < b.first;
+    });
+    for (int32_t i = 0; i < n_active; ++i) {
+        sctx->host_token_ids[i] = entries[i].first;
+        sctx->host_counts   [i] = entries[i].second;
+    }
+
+    ggml_backend_tensor_set(sctx->inp_token_ids, sctx->host_token_ids.data(), 0, n_active * sizeof(int32_t));
+    ggml_backend_tensor_set(sctx->inp_counts,    sctx->host_counts.data(),    0, n_active * sizeof(int32_t));
+    ggml_backend_tensor_set(sctx->inp_n_active,   &n_active,                   0, sizeof(int32_t));
+}
+
 static struct llama_sampler_i llama_sampler_penalties_i = {
     /* .name              = */ llama_sampler_penalties_name,
     /* .accept            = */ llama_sampler_penalties_accept,
@@ -2734,10 +2900,10 @@ static struct llama_sampler_i llama_sampler_penalties_i = {
     /* .reset             = */ llama_sampler_penalties_reset,
     /* .clone             = */ llama_sampler_penalties_clone,
     /* .free              = */ llama_sampler_penalties_free,
-    /* .backend_init      = */ nullptr,
+    /* .backend_init      = */ llama_sampler_penalties_backend_init,
     /* .backend_accept    = */ nullptr,
-    /* .backend_apply     = */ nullptr,
-    /* .backend_set_input = */ nullptr,
+    /* .backend_apply     = */ llama_sampler_penalties_backend_apply,
+    /* .backend_set_input = */ llama_sampler_penalties_backend_set_input,
 };
 
 struct llama_sampler * llama_sampler_init_penalties(
@@ -2755,14 +2921,11 @@ struct llama_sampler * llama_sampler_init_penalties(
 
     return llama_sampler_init(
         /* .iface = */ &llama_sampler_penalties_i,
-        /* .ctx   = */ new llama_sampler_penalties {
-            /* .penalty_last_n  = */ penalty_last_n,
-            /* .penalty_repeat  = */ penalty_repeat,
-            /* .penalty_freq    = */ penalty_freq,
-            /* .penalty_present = */ penalty_present,
-            /* .prev            = */ ring_buffer<llama_token>(penalty_last_n),
-            /* .token_count     = */ {},
-        }
+        /* .ctx   = */ new llama_sampler_penalties(
+            penalty_last_n,
+            penalty_repeat,
+            penalty_freq,
+            penalty_present)
     );
 }
 

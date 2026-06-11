@@ -8317,6 +8317,80 @@ void ggml_compute_forward_top_k(
     }
 }
 
+// ggml_compute_forward_penalties
+
+static void ggml_compute_forward_penalties_f32(
+    const ggml_compute_params * params,
+    ggml_tensor * dst) {
+    const ggml_tensor * logits   = dst->src[0];
+    const ggml_tensor * ids      = dst->src[1];
+    const ggml_tensor * counts   = dst->src[2];
+    const ggml_tensor * n_active = dst->src[3];
+
+    const float penalty_repeat  = ggml_get_op_params_f32(dst, 0);
+    const float penalty_freq    = ggml_get_op_params_f32(dst, 1);
+    const float penalty_present = ggml_get_op_params_f32(dst, 2);
+
+    const int32_t n = *(const int32_t *) n_active->data;
+
+    if (n <= 0 ||
+        (penalty_repeat == 1.0f && penalty_freq == 0.0f && penalty_present == 0.0f)) {
+        return;
+    }
+
+    const int ith = params->ith;
+    const int nth = params->nth;
+
+    float * logits_data = (float *) dst->data;
+
+    const int32_t * ids_data    = (const int32_t *) ids->data;
+    const int32_t * counts_data = (const int32_t *) counts->data;
+
+    for (int32_t i = ith; i < n; i += nth) {
+        const int32_t tok = ids_data[i];
+        const int32_t cnt = counts_data[i];
+
+        if (tok < 0 || tok >= (int32_t) logits->ne[0]) {
+            continue;
+        }
+
+        float x = logits_data[tok];
+
+        if (penalty_repeat != 1.0f) {
+            if (x <= 0.0f) {
+                x *= penalty_repeat;
+            } else {
+                x /= penalty_repeat;
+            }
+        }
+
+        x -= float(cnt) * penalty_freq;
+        if (cnt > 0) {
+            x -= penalty_present;
+        }
+
+        logits_data[tok] = x;
+    }
+}
+
+void ggml_compute_forward_penalties(
+    const ggml_compute_params * params,
+    ggml_tensor * dst) {
+
+    const ggml_tensor * src0 = dst->src[0];
+
+    switch (src0->type) {
+        case GGML_TYPE_F32:
+            {
+                ggml_compute_forward_penalties_f32(params, dst);
+            } break;
+        default:
+            {
+                GGML_ABORT("fatal error");
+            }
+    }
+}
+
 static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
         const ggml_compute_params * params,
         ggml_tensor * dst,
