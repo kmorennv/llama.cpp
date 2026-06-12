@@ -3330,6 +3330,8 @@ private:
             // on successful decode, restore the original batch size
             n_batch = llama_n_batch(ctx_tgt);
 
+            const int64_t t_batch_decode_us = ggml_time_us();
+
             // handle `n_cmpl > 1` tasks - when the main prompt is processed, activate all child tasks too
             for (auto & slot : slots) {
                 if (slot.state == SLOT_STATE_DONE_PROMPT && slot.task->is_parent()) {
@@ -3404,11 +3406,28 @@ private:
 
                 const int tok_idx = slot.i_batch - i;
 
+                const int64_t t_decode_sample = slot.task->params.sampling.timing_decode_per_token
+                    && slot.state == SLOT_STATE_GENERATING
+                    ? t_batch_decode_us
+                    : 0;
+
+                const int64_t t_sample = slot.task->params.sampling.timing_per_token
+                    ? ggml_time_us()
+                    : 0;
+
                 llama_token id = common_sampler_sample(slot.smpl.get(), slot.ctx_tgt, tok_idx);
 
                 slot.i_batch = -1;
 
                 common_sampler_accept(slot.smpl.get(), id, true);
+
+                if (t_sample > 0) {
+                    common_sampler_record_sample(slot.smpl.get(), ggml_time_us() - t_sample);
+                }
+
+                if (t_decode_sample > 0) {
+                    common_sampler_record_decode_sample(slot.smpl.get(), ggml_time_us() - t_decode_sample);
+                }
 
                 // here we have synchronized the llama_context (due to the sampling above), so we can do time measurement
                 const int64_t t_current = ggml_time_us();

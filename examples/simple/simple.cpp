@@ -179,7 +179,14 @@ int main(int argc, char ** argv) {
 
         // sample the next token
         {
+            const int64_t t_sample = sparams.no_perf ? 0 : ggml_time_us();
+
             new_token_id = llama_sampler_sample(smpl, ctx, -1);
+
+            if (t_sample > 0) {
+                fprintf(stderr, "%s: token %d: sample = %lld us\n",
+                        __func__, n_decode + 1, (long long) (ggml_time_us() - t_sample));
+            }
 
             // is it an end of generation?
             if (llama_vocab_is_eog(vocab, new_token_id)) {

@@ -64,6 +64,24 @@ struct llama_sampler * common_sampler_get(const struct common_sampler * gsmpl);
 //
 llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_context * ctx, int idx, bool grammar_first = false);
 
+struct common_sampler_decode_sample_result {
+    int         ret;         // llama_decode() return value, 0 on success
+    llama_token token;
+    int64_t     elapsed_us;  // wall time for decode + sample + accept
+};
+
+// llama_decode() + common_sampler_sample() + common_sampler_accept()
+common_sampler_decode_sample_result common_sampler_decode_sample(
+    struct common_sampler * gsmpl,
+    struct llama_context  * ctx,
+    struct llama_batch      batch,
+    int                     idx,
+    bool                    is_generated   = true,
+    bool                    grammar_first  = false);
+
+void common_sampler_record_sample(struct common_sampler * gsmpl, int64_t elapsed_us);
+void common_sampler_record_decode_sample(struct common_sampler * gsmpl, int64_t elapsed_us);
+
 // generalized version of common_sampler_sample
 //
 // will cross-reference the sampled tokens with a batch of draft tokens and accept those that match

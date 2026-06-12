@@ -167,6 +167,12 @@ struct common_sampler {
     }
 
     mutable int64_t t_total_us = 0;
+
+    mutable int64_t t_sample_us        = 0;
+    mutable int32_t n_sample_timed     = 0;
+
+    mutable int64_t t_decode_sample_us = 0;
+    mutable int32_t n_decode_sample    = 0;
 };
 
 std::string common_params_sampling::print() const {
@@ -507,6 +513,20 @@ void common_perf_print(const struct llama_context * ctx, const struct common_sam
         // note: the sampling time includes the samplers time + extra time spent in common/sampling
         LOG_INF("%s:    sampling time = %10.2f ms\n", __func__, t_sampling_ms);
         LOG_INF("%s:    samplers time = %10.2f ms / %5d tokens\n", __func__, data.t_sample_ms, data.n_sample);
+
+        if (gsmpl->params.timing_per_token && gsmpl->n_sample_timed > 0) {
+            const double t_sample_ms = 1e-3 * gsmpl->t_sample_us;
+            LOG_INF("%s:     sample time = %10.2f ms / %5d tokens (%8.2f us per token)\n",
+                    __func__, t_sample_ms, gsmpl->n_sample_timed,
+                    gsmpl->t_sample_us / (double) gsmpl->n_sample_timed);
+        }
+
+        if (gsmpl->params.timing_decode_per_token && gsmpl->n_decode_sample > 0) {
+            const double t_decode_sample_ms = 1e-3 * gsmpl->t_decode_sample_us;
+            LOG_INF("%s: decode+sample time = %10.2f ms / %5d tokens (%8.2f us per token)\n",
+                    __func__, t_decode_sample_ms, gsmpl->n_decode_sample,
+                    gsmpl->t_decode_sample_us / (double) gsmpl->n_decode_sample);
+        }
     }
 
     if (ctx) {
@@ -634,6 +654,71 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
 #endif
 
     return id;
+}
+
+common_sampler_decode_sample_result common_sampler_decode_sample(
+        struct common_sampler * gsmpl,
+        struct llama_context  * ctx,
+        struct llama_batch      batch,
+        int                     idx,
+        bool                    is_generated,
+        bool                    grammar_first) {
+    common_sampler_decode_sample_result result = {
+        /* .ret         = */ 0,
+        /* .token       = */ LLAMA_TOKEN_NULL,
+        /* .elapsed_us  = */ 0,
+    };
+
+    const int64_t t0 = ggml_time_us();
+
+    result.ret = llama_decode(ctx, batch);
+    if (result.ret != 0) {
+        result.elapsed_us = ggml_time_us() - t0;
+        return result;
+    }
+
+    result.token = common_sampler_sample(gsmpl, ctx, idx, grammar_first);
+    common_sampler_accept(gsmpl, result.token, is_generated);
+
+    result.elapsed_us = ggml_time_us() - t0;
+
+    gsmpl->t_decode_sample_us += result.elapsed_us;
+    gsmpl->n_decode_sample++;
+
+    if (gsmpl->params.timing_decode_per_token) {
+        LOG_INF("%s: token %d: decode+sample = %lld us\n",
+                __func__, gsmpl->n_decode_sample, (long long) result.elapsed_us);
+    }
+
+    return result;
+}
+
+void common_sampler_record_sample(struct common_sampler * gsmpl, int64_t elapsed_us) {
+    if (!gsmpl || elapsed_us <= 0) {
+        return;
+    }
+
+    gsmpl->t_sample_us += elapsed_us;
+    gsmpl->n_sample_timed++;
+
+    if (gsmpl->params.timing_per_token) {
+        LOG_INF("%s: token %d: sample = %lld us\n",
+                __func__, gsmpl->n_sample_timed, (long long) elapsed_us);
+    }
+}
+
+void common_sampler_record_decode_sample(struct common_sampler * gsmpl, int64_t elapsed_us) {
+    if (!gsmpl || elapsed_us <= 0) {
+        return;
+    }
+
+    gsmpl->t_decode_sample_us += elapsed_us;
+    gsmpl->n_decode_sample++;
+
+    if (gsmpl->params.timing_decode_per_token) {
+        LOG_INF("%s: token %d: decode+sample = %lld us\n",
+                __func__, gsmpl->n_decode_sample, (long long) elapsed_us);
+    }
 }
 
 std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sampler * gsmpl, struct llama_context * ctx, const std::vector<int> & idxs, const llama_tokens & draft, bool grammar_first) {

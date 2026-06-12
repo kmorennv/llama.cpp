@@ -237,8 +237,9 @@ struct common_params_sampling {
     float   mirostat_tau       = 5.00f;  // target entropy
     float   mirostat_eta       = 0.10f;  // learning rate
     bool    ignore_eos         = false;
-    bool    no_perf            = false;  // disable performance metrics
-    bool    timing_per_token   = false;
+    bool    no_perf                 = false;  // disable performance metrics
+    bool    timing_per_token        = false;  // log sample+accept wall time per token
+    bool    timing_decode_per_token = false;  // log decode+sample+accept wall time per token
 
     uint64_t user_sampling_config = 0; // bitfield to track user-specified samplers
 

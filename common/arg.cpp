@@ -1419,6 +1419,20 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_PERF"));
     add_opt(common_arg(
+        {"--timing-per-token"},
+        "log wall time per token for sampling only (sample+accept, excludes llama_decode)",
+        [](common_params & params) {
+            params.sampling.timing_per_token = true;
+        }
+    ).set_sampling().set_env("LLAMA_ARG_TIMING_PER_TOKEN"));
+    add_opt(common_arg(
+        {"--timing-decode-per-token"},
+        "log wall time per token for llama_decode() + sampling (decode+sample+accept)",
+        [](common_params & params) {
+            params.sampling.timing_decode_per_token = true;
+        }
+    ).set_sampling().set_env("LLAMA_ARG_TIMING_DECODE_PER_TOKEN"));
+    add_opt(common_arg(
         {"--show-timings"},
         {"--no-show-timings"},
         string_format("whether to show timing information after each response (default: %s)", params.show_timings ? "true" : "false"),

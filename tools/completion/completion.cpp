@@ -584,8 +584,16 @@ int llama_completion(int argc, char ** argv) {
     }
 
     while ((n_remain != 0 && !is_antiprompt) || params.interactive) {
+        const bool gen_step = ((int) embd_inp.size() <= n_consumed && !is_interacting);
+
+        int64_t t_decode_sample = 0;
+
         // predict
         if (!embd.empty()) {
+            if (params.sampling.timing_decode_per_token && gen_step) {
+                t_decode_sample = ggml_time_us();
+            }
+
             // Note: (n_ctx - 4) here is to match the logic for commandline prompt handling via
             // --prompt or --file which uses the same value.
             int max_embd_size = n_ctx - 4;
@@ -706,9 +714,19 @@ int llama_completion(int argc, char ** argv) {
 
         if ((int) embd_inp.size() <= n_consumed && !is_interacting) {
 
+            const int64_t t_sample = params.sampling.timing_per_token ? ggml_time_us() : 0;
+
             const llama_token id = common_sampler_sample(smpl, ctx, -1);
 
             common_sampler_accept(smpl, id, /* accept_grammar= */ true);
+
+            if (t_sample > 0) {
+                common_sampler_record_sample(smpl, ggml_time_us() - t_sample);
+            }
+
+            if (t_decode_sample > 0) {
+                common_sampler_record_decode_sample(smpl, ggml_time_us() - t_decode_sample);
+            }
 
             // LOG_DBG("last: %s\n", string_from(ctx, smpl->prev.to_vector()).c_str());
 
