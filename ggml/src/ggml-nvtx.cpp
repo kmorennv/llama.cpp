@@ -55,6 +55,24 @@ GGML_API void ggml_nvtx_range_end() {
     nvtxRangePop();
 }
 
+GGML_API uint64_t ggml_nvtx_range_start(const char * name, uint32_t color) {
+    ggml_nvtx_ensure_init();
+
+    nvtxEventAttributes_t attr{};
+    attr.version       = NVTX_VERSION;
+    attr.size          = NVTX_EVENT_ATTRIB_STRUCT_SIZE;
+    attr.colorType     = NVTX_COLOR_ARGB;
+    attr.color         = color;
+    attr.messageType   = NVTX_MESSAGE_TYPE_ASCII;
+    attr.message.ascii = name;
+    return nvtxRangeStartEx(&attr);
+}
+
+GGML_API void ggml_nvtx_range_stop(uint64_t id) {
+    ggml_nvtx_ensure_init();
+    nvtxRangeEnd(id);
+}
+
 GGML_API void ggml_nvtx_mark_impl(const char * name, uint32_t color) {
     ggml_nvtx_ensure_init();
 

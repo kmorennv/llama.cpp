@@ -1,5 +1,7 @@
 #include "penalty.cuh"
 
+#include "ggml-nvtx.h"
+
 #include <algorithm>
 #include <cstdint>
 
@@ -101,6 +103,21 @@ static bool ggml_cuda_penalties_use_dense(const int32_t n_active, const int32_t 
     return n_active > vocab / k_penalties_dense_ratio;
 }
 
+#ifdef GGML_NVTX
+
+// stream-ordered NVTX: begin runs after prior stream work, end runs after penalty kernels only
+static uint64_t g_penalties_nvtx_id = 0;
+
+static void ggml_cuda_penalties_nvtx_begin(void *) {
+    g_penalties_nvtx_id = ggml_nvtx_range_start("penalties_gpu", GGML_NVTX_COLOR_SAMPLER_BACKEND);
+}
+
+static void ggml_cuda_penalties_nvtx_end(void *) {
+    ggml_nvtx_range_stop(g_penalties_nvtx_id);
+}
+
+#endif // GGML_NVTX
+
 void ggml_cuda_op_penalties(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * logits   = dst->src[0];
     const ggml_tensor * ids      = dst->src[1];
@@ -141,6 +158,10 @@ void ggml_cuda_op_penalties(ggml_backend_cuda_context & ctx, ggml_tensor * dst) 
     const int block_size = 256;
     cudaStream_t stream  = ctx.stream();
 
+#ifdef GGML_NVTX
+    CUDA_CHECK(cudaLaunchHostFunc(stream, ggml_cuda_penalties_nvtx_begin, nullptr));
+#endif
+
     if (ggml_cuda_penalties_use_dense(n_active_h, vocab)) {
         ggml_cuda_pool & pool = ctx.pool();
 
@@ -159,4 +180,8 @@ void ggml_cuda_op_penalties(ggml_backend_cuda_context & ctx, ggml_tensor * dst) 
         k_penalties_sparse<<<grid_size, block_size, 0, stream>>>(
             logits_d, ids_d, cnt_d, n_active_h, vocab, penalty_repeat, penalty_freq, penalty_present);
     }
+
+#ifdef GGML_NVTX
+    CUDA_CHECK(cudaLaunchHostFunc(stream, ggml_cuda_penalties_nvtx_end, nullptr));
+#endif
 }

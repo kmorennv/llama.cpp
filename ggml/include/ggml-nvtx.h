@@ -20,6 +20,8 @@ extern "C" {
 GGML_API void ggml_nvtx_init();
 GGML_API void ggml_nvtx_range_begin(const char * name, uint32_t color);
 GGML_API void ggml_nvtx_range_end();
+GGML_API uint64_t ggml_nvtx_range_start(const char * name, uint32_t color);
+GGML_API void ggml_nvtx_range_stop(uint64_t id);
 GGML_API void ggml_nvtx_mark_impl(const char * name, uint32_t color);
 GGML_API void ggml_nvtx_self_test();
 
