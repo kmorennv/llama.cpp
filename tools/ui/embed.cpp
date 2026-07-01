@@ -259,7 +259,11 @@ int main(int argc, char ** argv) {
                 return 1;
             }
             cpp += fmt("static const unsigned char asset_%d_data[] = {", i);
-            append_bytes_hex(cpp, bytes);
+            if (bytes.empty()) {
+                cpp += "0x00";
+            } else {
+                append_bytes_hex(cpp, bytes);
+            }
             const auto hash = fnv_hash(bytes.data(), bytes.size());
 
             cpp += fmt("};\nstatic const std::size_t   asset_%d_size = %zu;\n",
