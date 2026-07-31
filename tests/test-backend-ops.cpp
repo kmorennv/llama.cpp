@@ -4421,8 +4421,9 @@ static void init_mul_mat_id_tensors(ggml_context * ctx, int n_mats) {
     }
 }
 
-// GGML_TYPE_NVFP4 MMQ + weight-scale epilogue
+// MMQ + weight-scale epilogue
 struct test_mul_mat_mmq_fusion : public test_case {
+    const ggml_type type;
     const bool use_id;
     const int64_t m;
     const int64_t n;
@@ -4437,8 +4438,9 @@ struct test_mul_mat_mmq_fusion : public test_case {
 
     test_mul_mat_mmq_fusion(
             bool use_id, int64_t m = 32, int64_t n = 64, int64_t k = 256, int n_mats = 16, int n_used = 8,
-            bool b = false, bool with_scale = true, int expert = -1, int64_t n_channels = 1, int64_t n_samples = 1)
-        : use_id(use_id), m(m), n(n), k(k), n_mats(n_mats), n_used(n_used), b(b), with_scale(with_scale),
+            bool b = false, bool with_scale = true, int expert = -1, int64_t n_channels = 1, int64_t n_samples = 1,
+            ggml_type type = GGML_TYPE_NVFP4)
+        : type(type), use_id(use_id), m(m), n(n), k(k), n_mats(n_mats), n_used(n_used), b(b), with_scale(with_scale),
           expert(expert), n_channels(n_channels), n_samples(n_samples) {
         GGML_ASSERT(n_used <= n_mats);
         GGML_ASSERT(expert >= -1 && expert < n_mats);
@@ -4450,7 +4452,7 @@ struct test_mul_mat_mmq_fusion : public test_case {
     }
 
     std::string vars() override {
-        std::string result = VARS_TO_STR6(use_id, m, n, k, n_mats, n_used);
+        std::string result = VARS_TO_STR7(type, use_id, m, n, k, n_mats, n_used);
         if (b || !with_scale || expert != -1 || n_channels != 1 || n_samples != 1) {
             result += "," + VARS_TO_STR5(b, with_scale, expert, n_channels, n_samples);
         }
@@ -4470,7 +4472,7 @@ struct test_mul_mat_mmq_fusion : public test_case {
     }
 
     double max_nmse_err(ggml_backend_t backend) override {
-        if (backend_has_feature(backend, "BLACKWELL_NATIVE_FP4")) {
+        if ((type == GGML_TYPE_MXFP4 || type == GGML_TYPE_NVFP4) && backend_has_feature(backend, "BLACKWELL_NATIVE_FP4")) {
             return 2e-2;
         }
         return max_nmse_err();
@@ -4491,7 +4493,7 @@ struct test_mul_mat_mmq_fusion : public test_case {
 
     ggml_tensor * build_graph(ggml_context * ctx, ggml_context * ctx_weights) override {
         if (!use_id) {
-            ggml_tensor * weights = ggml_new_tensor_2d(ctx, GGML_TYPE_NVFP4, k, n);
+            ggml_tensor * weights = ggml_new_tensor_2d(ctx, type, k, n);
             ggml_tensor * input;
             if (n_channels == 1 && n_samples == 1) {
                 input = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, m);
@@ -4510,7 +4512,7 @@ struct test_mul_mat_mmq_fusion : public test_case {
         }
 
         GGML_ASSERT(ctx_weights);
-        ggml_tensor * weights = ggml_new_tensor_3d(ctx_weights, GGML_TYPE_NVFP4, k, n, n_mats);
+        ggml_tensor * weights = ggml_new_tensor_3d(ctx_weights, type, k, n, n_mats);
         ggml_tensor * input   = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, k, b ? 1 : n_used, m);
         ggml_tensor * ids     = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_mats, m);
         ggml_set_name(ids, "ids");
@@ -8183,6 +8185,23 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_mul_mat_mmq_fusion(false, 11,  64, 2048, 16, 8, false, true, -1, 3, 2));
     test_cases.emplace_back(new test_mul_mat_mmq_fusion(false, 11,  64, 2048, 16, 8, false, false));
     test_cases.emplace_back(new test_mul_mat_mmq_fusion(true,  11,  64, 2048,  4, 1, false, false, 3));
+
+    for (ggml_type type : {
+            GGML_TYPE_Q1_0, GGML_TYPE_Q4_0, GGML_TYPE_Q4_1, GGML_TYPE_Q5_0, GGML_TYPE_Q5_1, GGML_TYPE_Q8_0,
+            GGML_TYPE_Q2_K, GGML_TYPE_Q3_K, GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K,
+            GGML_TYPE_IQ1_S, GGML_TYPE_IQ2_XXS, GGML_TYPE_IQ2_XS, GGML_TYPE_IQ2_S,
+            GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ3_S, GGML_TYPE_IQ4_XS, GGML_TYPE_IQ4_NL, GGML_TYPE_MXFP4 }) {
+        test_cases.emplace_back(new test_mul_mat_mmq_fusion(false, 32, 64, 256, 16, 8, false, true, -1, 1, 1, type));
+        test_cases.emplace_back(new test_mul_mat_mmq_fusion(true,  32, 64, 256, 16, 8, false, true, -1, 1, 1, type));
+    }
+    for (ggml_type type : { GGML_TYPE_Q4_K, GGML_TYPE_Q5_K }) {
+        for (bool use_id : { false, true }) {
+            test_cases.emplace_back(new test_mul_mat_mmq_fusion(use_id, 11,  256, 4096, 16, 8, false, true, -1, 1, 1, type));
+            test_cases.emplace_back(new test_mul_mat_mmq_fusion(use_id, 11, 4096,  256, 16, 8, false, true, -1, 1, 1, type));
+        }
+    }
+    test_cases.emplace_back(new test_mul_mat_mmq_fusion(false, 11, 64, 2048, 16, 8, false, false, -1, 1, 1, GGML_TYPE_Q4_K));
+    test_cases.emplace_back(new test_mul_mat_mmq_fusion(true,  11, 64, 2048,  4, 1, false, false, 3, 1, 1, GGML_TYPE_Q4_K));
 
     // unary ops
     for (ggml_type type : {GGML_TYPE_F16, GGML_TYPE_F32}) {

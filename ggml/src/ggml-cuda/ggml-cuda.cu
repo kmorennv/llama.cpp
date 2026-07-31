@@ -1813,11 +1813,7 @@ static bool ggml_cuda_should_fuse_mul_mat_mmq(const ggml_tensor * mm) {
     const ggml_tensor * src0 = mm->src[0];
     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
 
-    if (src0->type != GGML_TYPE_NVFP4) {
-        return false;
-    }
-
-    if (mm->op == GGML_OP_MUL_MAT) { // check for MMQ in dense models 
+    if (mm->op == GGML_OP_MUL_MAT) { // check for MMQ in dense models
         const int warp_size = ggml_cuda_info().devices[ggml_cuda_get_device()].warp_size;
         return mm->ne[1] > 1 &&
             !ggml_cuda_should_use_mmvf(src0->type, cc, src0->ne, src0->nb, mm->ne[1]) &&
@@ -1826,7 +1822,7 @@ static bool ggml_cuda_should_fuse_mul_mat_mmq(const ggml_tensor * mm) {
             ggml_cuda_should_use_mmq(src0->type, cc, mm->ne[1], /*n_experts=*/0);
     }
 
-    if (mm->op == GGML_OP_MUL_MAT_ID) { // check for MMQ in MoE models 
+    if (mm->op == GGML_OP_MUL_MAT_ID) { // check for MMQ in MoE models
         const int64_t n_tokens = mm->src[1]->ne[2];
         const bool use_mmvq = n_tokens <= MMVQ_MAX_BATCH_SIZE &&
             ggml_is_quantized(src0->type) && n_tokens <= get_mmvq_mmid_max_batch(src0->type, cc);
@@ -3371,8 +3367,8 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         }
 
         const ggml_tensor * scale = scale_lhs_mm ? scale_node->src[1] : scale_node->src[0];
-        if (mm_node->src[0]->type != GGML_TYPE_NVFP4 || scale_node->type != GGML_TYPE_F32 ||
-                scale->type != GGML_TYPE_F32 || !ggml_is_contiguous(scale) || ggml_nelements(scale) != 1 ||
+        if (scale_node->type != GGML_TYPE_F32 || scale->type != GGML_TYPE_F32 ||
+                !ggml_is_contiguous(scale) || ggml_nelements(scale) != 1 ||
                 !ggml_are_same_shape(scale_node, mm_node)) {
             return nullptr;
         }
@@ -3391,8 +3387,8 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         }
 
         const ggml_tensor * scale = reshape->src[0];
-        if (mm_node->src[0]->type != GGML_TYPE_NVFP4 || scale_node->type != GGML_TYPE_F32 ||
-                scale->type != GGML_TYPE_F32 || !ggml_is_contiguous(scale) || ggml_nelements(scale) != mm_node->src[0]->ne[2] ||
+        if (scale_node->type != GGML_TYPE_F32 || scale->type != GGML_TYPE_F32 ||
+                !ggml_is_contiguous(scale) || ggml_nelements(scale) != mm_node->src[0]->ne[2] ||
                 !ggml_are_same_shape(scale_node, mm_node)) {
             return nullptr;
         }
@@ -3491,7 +3487,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                 fusion_data.gate_scale = gate_scale;
                 fusion_data.glu_op     = ggml_get_glu_op(glu);
 
-                if (ggml_cuda_should_fuse_mul_mat_vec_q(up_n)) {
+                if (src0->type == GGML_TYPE_NVFP4 && ggml_cuda_should_fuse_mul_mat_vec_q(up_n)) {
                     ggml_cuda_mul_mat_vec_q(*cuda_ctx, src0, src1, ids, cgraph->nodes[glu_idx], &fusion_data);
                     fused_mul_mat_vec = true;
                     fused_node_count  = n_ops;
@@ -3584,7 +3580,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                 fusion_data.gate_scale = gate_scale;
                 fusion_data.glu_op     = ggml_get_glu_op(glu);
 
-                if (ggml_cuda_should_fuse_mul_mat_vec_q(up_n)) {
+                if (src0->type == GGML_TYPE_NVFP4 && ggml_cuda_should_fuse_mul_mat_vec_q(up_n)) {
                     ggml_cuda_mul_mat_vec_q(*cuda_ctx, src0, src1, ids, cgraph->nodes[glu_idx], &fusion_data);
                     fused_mul_mat_vec = true;
                     fused_node_count  = n_ops;
@@ -3784,7 +3780,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                 break;
             }
 
-            if (ggml_cuda_should_fuse_mul_mat_vec_q(mm_node)) {
+            if (src0->type == GGML_TYPE_NVFP4 && ggml_cuda_should_fuse_mul_mat_vec_q(mm_node)) {
                 ggml_cuda_mul_mat_vec_q(*cuda_ctx, src0, src1, ids, out_node, &fusion_data);
                 fused_mul_mat_vec = true;
                 fused_node_count  = n_ops;

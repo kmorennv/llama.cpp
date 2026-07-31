@@ -462,9 +462,9 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
                         sum[(j0/nwarps) * (I/warp_size) + i0/warp_size] * x_scale;
                 }
             } else {
-                dst[ids_dst[j]*stride + i] = sum[(j0/nwarps) * (I/warp_size) + i0/warp_size];
+                const float value = sum[(j0/nwarps) * (I/warp_size) + i0/warp_size];
+                dst[ids_dst[j]*stride + i] = x_scale == 1.0f ? value : value * x_scale;
                 GGML_UNUSED(y_scale_used);
-                GGML_UNUSED(x_scale);
             }
         }
     }
@@ -517,9 +517,9 @@ static __device__ __forceinline__ void ggml_cuda_mmq_write_back_mma(
                             sum[(j0/tile_C::J + n)*tile_C::ne + l] * x_scale;
                     }
                 } else {
-                    dst[ids_dst[j]*stride + i] = sum[(j0/tile_C::J + n)*tile_C::ne + l];
+                    const float value = sum[(j0/tile_C::J + n)*tile_C::ne + l];
+                    dst[ids_dst[j]*stride + i] = x_scale == 1.0f ? value : value * x_scale;
                     GGML_UNUSED(y_scale_used);
-                    GGML_UNUSED(x_scale);
                 }
             }
         }
@@ -931,7 +931,7 @@ static __device__ __forceinline__ void mul_mat_q_process_tile(
     }
 
     float x_scale_factor = 1.0f;
-    if constexpr (type == GGML_TYPE_NVFP4 && !fixup) {
+    if constexpr (!fixup) {
         if (apply_x_scale) {
             x_scale_factor = mmq_x_scale_factor(x_scale, x_scale_idx);
         }
@@ -1321,12 +1321,7 @@ static __global__ void mul_mat_q_stream_k_fixup(
     tmp2 = fast_div_modulo(tmp, nsamples_y);
     const int wt = tmp2.y;
     const int it = tmp2.x;
-    float x_scale_factor = 1.0f;
-    if constexpr (type == GGML_TYPE_NVFP4) {
-        x_scale_factor = mmq_x_scale_factor(x_scale, ids_dst ? zt : 0);
-    } else {
-        GGML_UNUSED(x_scale);
-    }
+    const float x_scale_factor = mmq_x_scale_factor(x_scale, ids_dst ? zt : 0);
 
     if (!ids_dst) {
         const int offset_dst = wt*stride_sample_dst + zt*stride_channel_dst + jt*J*stride_col_dst + it*I;

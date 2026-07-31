@@ -10,7 +10,6 @@ static void mmq_args_set_x_scale(mmq_args & args, const ggml_cuda_mm_fusion_args
         return;
     }
 
-    GGML_ASSERT(args.type_x == GGML_TYPE_NVFP4);
     GGML_ASSERT(fusion->x_scale->type == GGML_TYPE_F32);
     GGML_ASSERT(ggml_is_contiguous(fusion->x_scale));
     GGML_ASSERT(ggml_nelements(fusion->x_scale) == (args.ids_dst ? args.nchannels_y : 1));
