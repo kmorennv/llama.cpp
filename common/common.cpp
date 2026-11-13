@@ -1279,6 +1279,7 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
     auto cparams = common_context_params_to_llama(params);
 
     common_fit_apply(params, mparams, cparams);
+    mparams.prepare_context = model_only ? nullptr : &cparams;
 
     llama_model * model = common_model_load(params.model.get_paths(), mparams);
     if (model == NULL) {

@@ -5,6 +5,14 @@
 #include "mmid.cuh"
 #include "convert.cuh"
 
+#if defined(GGML_CUDA_NVRTC) && !defined(__CUDACC_RTC__)
+#include "nvrtc-kernels.cuh"
+
+static std::string mmf_nvrtc_expression(const char * name, const char * type, int rows, int cols, int nwarps, const char * ids = "") {
+    return std::string(name) + "<" + type + "," + std::to_string(rows) + "," + std::to_string(cols) + "," + std::to_string(nwarps) + ids + ">";
+}
+#endif
+
 using namespace ggml_cuda_mma;
 
 #define MMF_ROWS_PER_BLOCK 32
@@ -20,6 +28,7 @@ static constexpr __host__ __device__ int64_t ggml_cuda_mmf_get_cols_per_block(co
     return ggml_cuda_mmf_use_compact_ids(has_ids, ncols_dst) ? MMF_IDS_COLS_PER_BLOCK : ncols_dst;
 }
 
+#ifndef __CUDACC_RTC__
 static __forceinline__ int64_t mmf_get_max_block_size(int cc) {
     if (GGML_CUDA_CC_IS_CDNA(cc)) {
         return 512;
@@ -35,6 +44,29 @@ static __forceinline__ int mmf_get_padding(int cc) {
         return 4;
     }
 }
+
+static int mmf_get_nwarps(int64_t ncols_x, int warp_size, int cc) {
+    int64_t nwarps_best = 1;
+    int64_t niter_best = (ncols_x + warp_size*2 - 1) / (warp_size*2);
+    for (int64_t nwarps = 2; nwarps <= mmf_get_max_block_size(cc)/warp_size; ++nwarps) {
+        const int64_t niter = (ncols_x + nwarps*warp_size*2 - 1) / (nwarps*warp_size*2);
+        if (niter < niter_best) {
+            niter_best = niter;
+            nwarps_best = nwarps;
+        }
+    }
+    return nwarps_best;
+}
+
+static int mmf_get_nbytes_shared(int rows_per_block, int cols_per_block, int nwarps, bool has_ids, int warp_size, int cc) {
+    const int rows_per_tile = volta_mma_available(cc) ? 32 : 16;
+    const int nbytes_shared_iter = nwarps * rows_per_tile * (warp_size + mmf_get_padding(cc)) * 4;
+    const int cols_padding = (amd_wmma_available(cc) || amd_mfma_available(cc)) ? 16 : 8;
+    const int nbytes_shared_combine = GGML_PAD(cols_per_block, cols_padding) * (nwarps*rows_per_block + mmf_get_padding(cc)) * 4;
+    const int nbytes_slotmap = has_ids ? GGML_PAD(cols_per_block, 16) * sizeof(int) : 0;
+    return std::max(nbytes_shared_iter, nbytes_shared_combine) + nbytes_slotmap;
+}
+#endif
 
 static constexpr __device__ int mmf_get_padding() {
 #if defined(AMD_MFMA_AVAILABLE)
@@ -53,9 +85,14 @@ struct mmf_ids_data {
     int sis1 = 0;
 };
 
+#ifndef __CUDACC_RTC__
 void ggml_cuda_mul_mat_f(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst);
 
 bool ggml_cuda_should_use_mmf(enum ggml_type type, int cc, int warp_size, const int64_t * scr0_ne, const size_t * src0_nb, const int src1_ncols, bool mul_mat_id);
+#ifdef GGML_CUDA_NVRTC
+void ggml_cuda_nvrtc_mmf_prepare(int device, const ggml_tensor * dst);
+#endif
+#endif
 
 template <typename T, int rows_per_block, int cols_per_block, int nwarps, bool has_ids>
 __launch_bounds__(ggml_cuda_get_physical_warp_size()*nwarps, 1)
@@ -596,6 +633,7 @@ static __global__ void mul_mat_f_ids(
 #endif // defined(VOLTA_MMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE) || defined(AMD_MFMA_AVAILABLE)
 }
 
+#ifndef __CUDACC_RTC__
 template<typename T, int rows_per_block, int cols_per_block, int nwarps>
 static inline void mul_mat_f_switch_ids(
         const T * x, const float * y, const int32_t * ids, float * dst,
@@ -606,6 +644,9 @@ static inline void mul_mat_f_switch_ids(
         const int64_t sample_ratio, const int64_t stride_sample_x, const int64_t stride_sample_y, const int64_t stride_sample_dst,
         const dim3 & block_nums, const dim3 & block_dims, const int nbytes_shared_total, cudaStream_t stream,
         const mmf_ids_data * ids_data) {
+#ifdef GGML_CUDA_NVRTC
+    const char * type = std::is_same_v<T, float> ? "float" : std::is_same_v<T, half2> ? "half2" : "nv_bfloat162";
+#endif
     if constexpr (cols_per_block == MMF_IDS_COLS_PER_BLOCK) {
         const bool has_ids_data = ids_data && ids_data->ids_src_compact;
 
@@ -618,11 +659,16 @@ static inline void mul_mat_f_switch_ids(
             const uint3 sis1_fd = ids_data->sis1 > 0 ? init_fastdiv_values((uint32_t) ids_data->sis1) : make_uint3(0, 0, 1);
             const uint3 nch_fd  = init_fastdiv_values((uint32_t) nchannels_dst);
 
-            mul_mat_f_ids<T, rows_per_block, cols_per_block, nwarps><<<block_nums_ids, block_dims, nbytes_shared_total, stream>>>
-                (x, y, ids_data->ids_src_compact, ids_data->ids_dst_compact, ids_data->tile_spec_dev, dst,
-                ncols_x, ncols_dst, nchannels_dst, stride_row, stride_col_y, stride_col_dst,
-                channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
-                sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst,
+#ifdef GGML_CUDA_NVRTC
+            ggml_cuda_nvrtc_launch("mmf.cuh", mmf_nvrtc_expression("mul_mat_f_ids", type, rows_per_block, cols_per_block, nwarps),
+                ggml_cuda_kernel_launch_params(block_nums_ids, block_dims, nbytes_shared_total, stream), 0, false,
+#else
+            mul_mat_f_ids<T, rows_per_block, cols_per_block, nwarps><<<block_nums_ids, block_dims, nbytes_shared_total, stream>>>(
+#endif
+                x, y, ids_data->ids_src_compact, ids_data->ids_dst_compact, ids_data->tile_spec_dev, dst,
+                int(ncols_x), int(ncols_dst), int(nchannels_dst), int(stride_row), int(stride_col_y), int(stride_col_dst),
+                int(channel_ratio), int(stride_channel_x), int(stride_channel_y), int(stride_channel_dst),
+                int(sample_ratio), int(stride_sample_x), int(stride_sample_y), int(stride_sample_dst),
                 sis1_fd, nch_fd);
             return;
         }
@@ -633,15 +679,25 @@ static inline void mul_mat_f_switch_ids(
         dim3 block_nums_ids = block_nums;
         block_nums_ids.y *= col_tiles;
 
-        mul_mat_f<T, rows_per_block, cols_per_block, nwarps, true><<<block_nums_ids, block_dims, nbytes_shared_total, stream>>>
-            (x, y, ids, dst, ncols_x, ncols_dst, nchannels_dst, stride_row, stride_col_y, stride_col_dst,
-             stride_col_id, stride_row_id, channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
-             sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst);
+#ifdef GGML_CUDA_NVRTC
+        ggml_cuda_nvrtc_launch("mmf.cuh", mmf_nvrtc_expression("mul_mat_f", type, rows_per_block, cols_per_block, nwarps, ",true"),
+            ggml_cuda_kernel_launch_params(block_nums_ids, block_dims, nbytes_shared_total, stream), 0, false,
+#else
+        mul_mat_f<T, rows_per_block, cols_per_block, nwarps, true><<<block_nums_ids, block_dims, nbytes_shared_total, stream>>>(
+#endif
+            x, y, ids, dst, int(ncols_x), int(ncols_dst), int(nchannels_dst), int(stride_row), int(stride_col_y), int(stride_col_dst),
+             int(stride_col_id), int(stride_row_id), int(channel_ratio), int(stride_channel_x), int(stride_channel_y), int(stride_channel_dst),
+             int(sample_ratio), int(stride_sample_x), int(stride_sample_y), int(stride_sample_dst));
     } else {
-        mul_mat_f<T, rows_per_block, cols_per_block, nwarps, false><<<block_nums, block_dims, nbytes_shared_total, stream>>>
-            (x, y, ids, dst, ncols_x, cols_per_block, nchannels_dst, stride_row, stride_col_y, stride_col_dst,
-             stride_col_id, stride_row_id, channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
-             sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst);
+#ifdef GGML_CUDA_NVRTC
+        ggml_cuda_nvrtc_launch("mmf.cuh", mmf_nvrtc_expression("mul_mat_f", type, rows_per_block, cols_per_block, nwarps, ",false"),
+            ggml_cuda_kernel_launch_params(block_nums, block_dims, nbytes_shared_total, stream), 0, false,
+#else
+        mul_mat_f<T, rows_per_block, cols_per_block, nwarps, false><<<block_nums, block_dims, nbytes_shared_total, stream>>>(
+#endif
+            x, y, ids, dst, int(ncols_x), cols_per_block, int(nchannels_dst), int(stride_row), int(stride_col_y), int(stride_col_dst),
+             int(stride_col_id), int(stride_row_id), int(channel_ratio), int(stride_channel_x), int(stride_channel_y), int(stride_channel_dst),
+             int(sample_ratio), int(stride_sample_x), int(stride_sample_y), int(stride_sample_dst));
     }
 }
 
@@ -655,11 +711,6 @@ void mul_mat_f_cuda(
         const int64_t stride_channel_x, const int64_t stride_channel_y, const int64_t stride_channel_dst, const int64_t nsamples_x,
         const int64_t nsamples_dst, const int64_t stride_sample_x, const int64_t stride_sample_y, const int64_t stride_sample_dst,
         cudaStream_t stream, const mmf_ids_data * ids_data) {
-    typedef tile<16, 8, T>     tile_A_16;
-    typedef tile<32, 8, T>     tile_A_32;
-    typedef tile<16, 8, T>     tile_B_16;
-    typedef tile< 8, 8, T>     tile_B_8;
-
     GGML_ASSERT(ncols_x      % 2 == 0);
     GGML_ASSERT(stride_row   % 2 == 0);
     GGML_ASSERT(stride_col_y % 2 == 0);
@@ -672,23 +723,9 @@ void mul_mat_f_cuda(
     const int cc        = ggml_cuda_info().devices[device].cc;
     const int warp_size = ggml_cuda_info().devices[device].warp_size;
 
-    int64_t nwarps_best     = 1;
-    int64_t niter_best      = (ncols_x + warp_size*2 - 1) / (warp_size*2);
-    int64_t max_block_size  = mmf_get_max_block_size(cc);
-    for (int64_t nwarps = 2; nwarps <= max_block_size/warp_size; nwarps++) {
-        const int64_t niter = (ncols_x + nwarps*warp_size*2 - 1) / (nwarps*warp_size*2);
-        if (niter < niter_best) {
-            niter_best  = niter;
-            nwarps_best = nwarps;
-        }
-    }
+    const int64_t nwarps_best = mmf_get_nwarps(ncols_x, warp_size, cc);
 
-    const int nbytes_shared_iter = nwarps_best * (volta_mma_available(cc) ? tile_A_32::I : tile_A_16::I) * (warp_size + mmf_get_padding(cc)) * 4;
-    const int nbytes_cols_per_block_pad = (amd_wmma_available(cc) || amd_mfma_available(cc)) ? tile_B_16::I : tile_B_8::I;
-    const int nbytes_shared_combine = GGML_PAD(cols_per_block, nbytes_cols_per_block_pad) * (nwarps_best*rows_per_block + mmf_get_padding(cc)) * 4;
-    const int nbytes_shared = std::max(nbytes_shared_iter, nbytes_shared_combine);
-    const int nbytes_slotmap = ids ? GGML_PAD(cols_per_block, 16) * sizeof(int) : 0;
-    const int nbytes_shared_total = nbytes_shared + nbytes_slotmap;
+    const int nbytes_shared_total = mmf_get_nbytes_shared(rows_per_block, cols_per_block, nwarps_best, ids != nullptr, warp_size, cc);
     const int64_t grid_y = ids ? nchannels_x : nchannels_dst;
 
     const dim3 block_nums(nrows_x/rows_per_block, grid_y, nsamples_dst);
@@ -914,6 +951,7 @@ static void mul_mat_f_switch_rows_per_block(
     DECL_MMF_CASE_HELPER(half2, MMF_ROWS_PER_BLOCK_CDNA, ncols_dst) \
     DECL_MMF_CASE_HELPER(nv_bfloat162, MMF_ROWS_PER_BLOCK_CDNA, ncols_dst)
 
+#ifndef GGML_CUDA_NVRTC
 DECL_MMF_CASE_EXTERN(1);
 DECL_MMF_CASE_EXTERN(2);
 DECL_MMF_CASE_EXTERN(3);
@@ -930,6 +968,8 @@ DECL_MMF_CASE_EXTERN(13);
 DECL_MMF_CASE_EXTERN(14);
 DECL_MMF_CASE_EXTERN(15);
 DECL_MMF_CASE_EXTERN(16);
+#endif
 #else
 #define DECL_MMF_CASE(ncols_dst)
 #endif
+#endif // __CUDACC_RTC__

@@ -197,6 +197,33 @@ cmake --build build --config Release
 
 To use a specific CCCL version instead of the one bundled with the installed CUDA Toolkit, add `-DGGML_CUDA_CCCL_VERSION=vMAJOR.MINOR.PATCH`. CUB DeviceTopK requires CCCL 3.4.3 or newer; older versions use the sort fallback.
 
+#### Compile model kernels at load time
+
+On Linux with CUDA 12.3 or newer, `-DGGML_CUDA_NVRTC=ON` moves the MMQ, MMVQ, MMF, MMVF and FlashAttention template instances from the normal build to runtime compilation. Other CUDA operations retain their normal build path. This option is off by default.
+
+```bash
+cmake -B build -DGGML_CUDA=ON -DGGML_CUDA_NVRTC=ON
+cmake --build build --config Release
+```
+
+The loader queues instances for the model's tensor types and dimensions while loading weights. Context preparation adds the kernels needed by the configured graph and waits for compilation before inference. Compilation targets the active GPU and uses the existing kernel implementations and dispatch rules. The first load requires additional CPU time; cached instances avoid recompilation on later loads.
+
+Common initialization and `llama-bench` pass the intended context settings to the loader. With FlashAttention explicitly enabled, verified Qwen3.5 and Qwen3.5 MoE layouts queue their MMA kernels before the weight kernels to overlap checkpoint reads and GPU uploads. Other attention kernels, models, and FlashAttention AUTO retain graph-based preparation.
+
+API callers can set `llama_model_params.prepare_context` to the intended context parameters to request early preparation. The pointer must remain valid until model loading returns. A NULL hint retains context-time preparation, and the actual context graph always adds any missing instances before inference.
+
+Runtime compilation requires NVRTC and the CUDA Toolkit headers, including CCCL, at the configured toolkit location. The ggml device sources are embedded in the backend, so the repository is not needed when running the binary.
+
+The normal build must include the exact architecture of each GPU used at runtime, because utility kernels still use AOT compilation. Use `-DCMAKE_CUDA_ARCHITECTURES=native` when building on the serving machine, or list the target architectures explicitly. Initialization fails when an exact target is missing.
+
+The process-wide pool retains compiled artifacts and loaded modules until process exit. Loading another model extends this pool; unloading a model does not release its kernel artifacts. If model loading is cancelled, queued compilation continues using copied descriptors and can serve a later load.
+
+Tensor parallelism (`--split-mode tensor`) and row splitting (`--split-mode row`) are not supported with this option and fail during model initialization. Use layer splitting or a single GPU.
+
+- `GGML_CUDA_NVRTC_THREADS` sets the number of compiler workers (default: half the CPU threads, capped at 4; accepted range: 1-32).
+- `GGML_CUDA_NVRTC_CACHE_DIR` sets the CUBIN cache directory. The default is `$XDG_CACHE_HOME/ggml-nvrtc-kernels` or `$HOME/.cache/ggml-nvrtc-kernels`. Set it to `0` to disable the disk cache.
+- `GGML_CUDA_NVRTC_VERBOSE=1` prints compilation progress and disk cache hits. The readiness log reports process-wide compilation counts and summed compiler time.
+
 Note that this also builds the CPU backend by default. On Windows on ARM, MSVC's
 support for the ARM NEON intrinsics used by the CPU backend may be incomplete, so
 a CUDA build produced entirely with MSVC might have a slower CPU backend. If CPU

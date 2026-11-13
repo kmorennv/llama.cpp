@@ -171,7 +171,7 @@ typedef sycl::half2 ggml_half2;
 
 #endif // GGML_COMMON_DECL_CUDA || GGML_COMMON_DECL_HIP
 
-#ifdef _MSC_VER
+#if defined(_MSC_VER) || defined(__CUDACC_RTC__)
 #define GGML_EXTENSION
 #else // _MSC_VER
 #define GGML_EXTENSION __extension__

@@ -61,6 +61,7 @@ extern "C" {
     struct llama_vocab;
     struct llama_model;
     struct llama_context;
+    struct llama_context_params;
     struct llama_sampler;
 
     typedef struct llama_memory_i * llama_memory_t;
@@ -347,6 +348,10 @@ extern "C" {
 
         // override key-value pairs of the model meta data
         const struct llama_model_kv_override * kv_overrides;
+
+        // Optional context settings for early kernel preparation (NULL = prepare during context creation).
+        // Only compilation settings are copied; the pointer must remain valid until model loading returns.
+        const struct llama_context_params * prepare_context;
 
         // Keep the booleans together to avoid misalignment during copy-by-value.
         bool vocab_only;      // only load the vocabulary, no weights

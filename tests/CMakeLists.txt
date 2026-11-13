@@ -365,6 +365,11 @@ endif()
 
 llama_build(test-backend-ops.cpp LINK ggml Threads::Threads)
 
+if (GGML_CUDA_NVRTC)
+    llama_build_and_test(test-cuda-nvrtc.cpp LABEL "main behavior backend" LINK ggml)
+    set_tests_properties(test-cuda-nvrtc PROPERTIES SKIP_RETURN_CODE 77)
+endif()
+
 llama_build_and_test(test-backend-tensor.cpp LINK ggml)
 
 if (BUILD_SHARED_LIBS)

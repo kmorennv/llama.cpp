@@ -6,6 +6,34 @@
 
 #include <cstdint>
 
+#ifdef __CUDACC_RTC__
+#define GGML_CUDA_FATTN_DEVICE_LAMBDA
+#else
+#define GGML_CUDA_FATTN_DEVICE_LAMBDA __device__
+#endif
+
+#if defined(GGML_CUDA_NVRTC) && !defined(__CUDACC_RTC__)
+#include "nvrtc-kernels.cuh"
+
+struct fattn_kernel_t {
+    const char * header;
+    const std::string & expression;
+};
+
+const std::string & fattn_nvrtc_expression_cached(const char * name, const int * values, const bool * enums, size_t count);
+
+template <typename... Args>
+static const std::string & fattn_nvrtc_expression(const char * name, Args... args) {
+    const int values[] = { int(args)... };
+    const bool enums[] = { std::is_same_v<Args, ggml_type>... };
+    return fattn_nvrtc_expression_cached(name, values, enums, sizeof...(args));
+}
+
+#define GGML_CUDA_FATTN_KERNEL(header, kernel, ...) fattn_kernel_t{header, fattn_nvrtc_expression(#kernel, __VA_ARGS__)}
+#else
+#define GGML_CUDA_FATTN_KERNEL(header, kernel, ...) kernel<__VA_ARGS__>
+#endif
+
 #define FATTN_KQ_STRIDE       256
 #define HALF_MAX_HALF         __float2half(65504.0f/2) // Use neg. of this instead of -INFINITY to initialize KQ max vals to avoid NaN upon subtraction.
 #define SOFTMAX_FTZ_THRESHOLD -20.0f                   // Softmax exp. of values smaller than this are flushed to zero to avoid NaNs.
@@ -18,6 +46,7 @@
 // The macro on the following line shifts it by a factor of 2**3=8, as was needed to fix https://github.com/ggml-org/llama.cpp/issues/18606 .
 #define FATTN_KQ_MAX_OFFSET (3.0f*0.6931f)
 
+#if !defined(GGML_CUDA_NVRTC) || defined(__CUDACC_RTC__)
 typedef void (* fattn_kernel_t)(
         const char * __restrict__ Q,
         const char * __restrict__ K,
@@ -41,6 +70,7 @@ typedef void (* fattn_kernel_t)(
                             const int32_t nb21, const int32_t nb22, const int64_t nb23,
                             const int32_t ne31, const int32_t ne32, const int32_t ne33,
                             const int32_t nb31, const int32_t nb32, const int64_t nb33);
+#endif
 
 typedef float (*vec_dot_KQ_t)(
     const char * __restrict__ K_c, const void * __restrict__ Q_v, const int * __restrict__ Q_q8 , const void * __restrict__ Q_ds);
@@ -51,6 +81,7 @@ struct ggml_cuda_flash_attn_ext_f16_extra_data {
     uintptr_t end;
 };
 
+#ifndef __CUDACC_RTC__
 static inline ggml_cuda_flash_attn_ext_f16_extra_data ggml_cuda_flash_attn_ext_get_f16_extra_data(
         const ggml_tensor * dst, const bool need_f16_K, const bool need_f16_V) {
     GGML_ASSERT(dst->op == GGML_OP_FLASH_ATTN_EXT);
@@ -84,6 +115,7 @@ static inline ggml_cuda_flash_attn_ext_f16_extra_data ggml_cuda_flash_attn_ext_g
 
     return data;
 }
+#endif
 
 template <int D, int nthreads>
 static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_f16(
@@ -774,8 +806,10 @@ static __global__ void flash_attn_mask_to_KV_max(
     KV_max[sequence*ne31 + jt] = KV_max_sj;
 }
 
+#ifndef __CUDACC_RTC__
 void ggml_cuda_flash_attn_ext_compact_mask(
         const ggml_tensor * mask, int32_t * indices, int32_t * counts, int32_t n_queries, int32_t ncols1, int32_t n_kv_max, cudaStream_t stream);
+#endif
 
 template<int D, int ncols1, int ncols2> // D == head size
 __launch_bounds__(D, 1)
@@ -1028,6 +1062,24 @@ static __global__ void flash_attn_combine_results(
     dst[tid] = VKQ_numerator / VKQ_denominator;
 }
 
+#ifndef __CUDACC_RTC__
+#ifdef GGML_CUDA_NVRTC
+void launch_fattn_nvrtc(int DV, int ncols1, int ncols2,
+    ggml_backend_cuda_context & ctx, ggml_tensor * dst, fattn_kernel_t fattn_kernel, const int nwarps, const size_t nbytes_shared,
+    const int nbatch_fa, const bool need_f16_K, const bool need_f16_V, const bool stream_k, const bool use_sparse,
+    const int warp_size, const bool async_kv_preload
+);
+
+template <int DV, int ncols1, int ncols2>
+void launch_fattn(
+    ggml_backend_cuda_context & ctx, ggml_tensor * dst, fattn_kernel_t fattn_kernel, const int nwarps, const size_t nbytes_shared,
+    const int nbatch_fa, const bool need_f16_K, const bool need_f16_V, const bool stream_k, const bool use_sparse,
+    const int warp_size = WARP_SIZE, const bool async_kv_preload = false
+) {
+    launch_fattn_nvrtc(DV, ncols1, ncols2, ctx, dst, fattn_kernel, nwarps, nbytes_shared,
+        nbatch_fa, need_f16_K, need_f16_V, stream_k, use_sparse, warp_size, async_kv_preload);
+}
+#else
 template <int DV, int ncols1, int ncols2>
 void launch_fattn(
     ggml_backend_cuda_context & ctx, ggml_tensor * dst, fattn_kernel_t fattn_kernel, const int nwarps, const size_t nbytes_shared,
@@ -1183,7 +1235,11 @@ void launch_fattn(
 
         KV_max.alloc(ne_KV_max);
         ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(blocks_num_KV_max, block_dim_KV_max, 0, main_stream);
+#ifdef GGML_CUDA_NVRTC
+        ggml_cuda_nvrtc_launch("fattn-common.cuh", fattn_nvrtc_expression("flash_attn_mask_to_KV_max", ncols1), launch_params, 0, true,
+#else
         ggml_cuda_kernel_launch(flash_attn_mask_to_KV_max<ncols1>, launch_params,
+#endif
             (const half2 *) mask->data, KV_max.ptr, iter_k, s31, s33);
         CUDA_CHECK(cudaGetLastError());
     }
@@ -1196,7 +1252,11 @@ void launch_fattn(
 
     const dim3 block_dim(warp_size, nwarps, 1);
     int max_blocks_per_sm = 1; // Max. number of active blocks limited by occupancy.
+#ifdef GGML_CUDA_NVRTC
+    max_blocks_per_sm = ggml_cuda_nvrtc_occupancy(fattn_kernel.header, fattn_kernel.expression, block_dim.x * block_dim.y * block_dim.z, nbytes_shared);
+#else
     CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&max_blocks_per_sm, fattn_kernel, block_dim.x * block_dim.y * block_dim.z, nbytes_shared));
+#endif
     GGML_ASSERT(max_blocks_per_sm > 0);
     int parallel_blocks = max_blocks_per_sm;
 
@@ -1310,7 +1370,11 @@ void launch_fattn(
     GGML_ASSERT(block_dim.x % warp_size == 0);
 
     ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(blocks_num, block_dim, nbytes_shared, main_stream);
+#ifdef GGML_CUDA_NVRTC
+    ggml_cuda_nvrtc_launch(fattn_kernel.header, fattn_kernel.expression, launch_params, nbytes_shared, true,
+#else
     ggml_cuda_kernel_launch(fattn_kernel, launch_params,
+#endif
         (const char *) Q->data,
         K_data,
         V_data,
@@ -1320,11 +1384,11 @@ void launch_fattn(
         kv_rows ? (const int *) kv_rows->data : nullptr,
         !stream_k && parallel_blocks > 1 ? dst_tmp.ptr : (float *) KQV->data, dst_tmp_meta.ptr,
         scale, max_bias, m0, m1, n_head_log2, logit_softcap,
-        Q->ne[0], ne01,     Q->ne[2], Q->ne[3], Q->nb[1], Q->nb[2], Q->nb[3],
-        K->ne[0], n_kv, K->ne[2], K->ne[3], nb11, nb12, nb13,
-        nb21, nb22, nb23,
-        mask ? mask->ne[1] : 0, mask ? mask->ne[2] : 0, mask ? mask->ne[3] : 0,
-        mask ? mask->nb[1] : 0, mask ? mask->nb[2] : 0, mask ? mask->nb[3] : 0
+        int32_t(Q->ne[0]), ne01, int32_t(Q->ne[2]), int32_t(Q->ne[3]), int32_t(Q->nb[1]), int32_t(Q->nb[2]), int32_t(Q->nb[3]),
+        int32_t(K->ne[0]), int32_t(n_kv), int32_t(K->ne[2]), int32_t(K->ne[3]), int32_t(nb11), int32_t(nb12), int64_t(nb13),
+        int32_t(nb21), int32_t(nb22), int64_t(nb23),
+        int32_t(mask ? mask->ne[1] : 0), int32_t(mask ? mask->ne[2] : 0), int32_t(mask ? mask->ne[3] : 0),
+        int32_t(mask ? mask->nb[1] : 0), int32_t(mask ? mask->nb[2] : 0), int64_t(mask ? mask->nb[3] : 0)
     );
     CUDA_CHECK(cudaGetLastError());
 
@@ -1342,9 +1406,13 @@ void launch_fattn(
             const dim3 blocks_num_combine = {(unsigned)ntiles_dst, ncols1, ncols2};
 
             const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(blocks_num_combine, block_dim_combine, 0, main_stream);
+#ifdef GGML_CUDA_NVRTC
+            ggml_cuda_nvrtc_launch("fattn-common.cuh", fattn_nvrtc_expression("flash_attn_stream_k_fixup_uniform", DV, ncols1, ncols2), launch_params, 0, true,
+#else
             ggml_cuda_kernel_launch(flash_attn_stream_k_fixup_uniform<DV, ncols1, ncols2>, launch_params,
+#endif
                 (float *) KQV->data, dst_tmp_meta.ptr,
-                 Q->ne[1], Q->ne[2], K->ne[2], nblocks_sk,
+                 int32_t(Q->ne[1]), int32_t(Q->ne[2]), int32_t(K->ne[2]), nblocks_sk,
                  gqa_ratio, bpt, fd0, fd1, fd2);
         } else if (ntiles_dst % blocks_num.x != 0) {
             // General fixup for the cases where nblocks_stream_k < ntiles_dst.
@@ -1359,9 +1427,13 @@ void launch_fattn(
             const dim3 blocks_num_combine = {blocks_num.x, ncols1, ncols2};
 
             const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(blocks_num_combine, block_dim_combine, 0, main_stream);
+#ifdef GGML_CUDA_NVRTC
+            ggml_cuda_nvrtc_launch("fattn-common.cuh", fattn_nvrtc_expression("flash_attn_stream_k_fixup_general", DV, ncols1, ncols2), launch_params, 0, true,
+#else
             ggml_cuda_kernel_launch(flash_attn_stream_k_fixup_general<DV, ncols1, ncols2>, launch_params,
+#endif
                 (float *) KQV->data, dst_tmp_meta.ptr,
-                 Q->ne[1], Q->ne[2], gqa_ratio, total_work,
+                 int32_t(Q->ne[1]), int32_t(Q->ne[2]), gqa_ratio, total_work,
                  fd_k_j_z_ne12, fd_k_j_z, fd_k_j, fd_k);
         }
     } else if (parallel_blocks > 1) {
@@ -1370,8 +1442,15 @@ void launch_fattn(
         const size_t nbytes_shared_combine = parallel_blocks*sizeof(float2);
 
         const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(blocks_num_combine, block_dim_combine, nbytes_shared_combine, main_stream);
+#ifdef GGML_CUDA_NVRTC
+        ggml_cuda_nvrtc_launch("fattn-common.cuh", fattn_nvrtc_expression("flash_attn_combine_results", DV), launch_params, 0, true,
+#else
         ggml_cuda_kernel_launch(flash_attn_combine_results<DV>, launch_params,
+#endif
             dst_tmp.ptr, dst_tmp_meta.ptr, (float *) KQV->data, parallel_blocks);
     }
     CUDA_CHECK(cudaGetLastError());
 }
+#endif // GGML_CUDA_NVRTC
+
+#endif // __CUDACC_RTC__

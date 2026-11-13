@@ -1010,6 +1010,8 @@ struct llama_model {
     virtual void load_vocab  (llama_model_loader & ml) = 0;
     virtual bool load_tensors(llama_model_loader & ml) = 0; // returns false if cancelled by progress_callback
 
+    virtual bool can_prepare_fattn() const { return false; }
+
     // model must define these
     virtual void load_arch_hparams(llama_model_loader & ml) = 0;
     virtual void load_arch_tensors(llama_model_loader & ml) = 0;

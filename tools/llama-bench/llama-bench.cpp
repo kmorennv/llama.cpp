@@ -2364,6 +2364,8 @@ int llama_bench(int argc, char ** argv) {
                 params.verbose ? GGML_LOG_LEVEL_DEBUG : GGML_LOG_LEVEL_ERROR);
        }
 
+        mparams.prepare_context = &cparams;
+
         // keep the same model between tests when possible
         if (!lmodel || !prev_inst || !inst.equal_mparams(*prev_inst)) {
             if (lmodel) {

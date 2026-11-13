@@ -1,12 +1,23 @@
 #pragma once
 
 #include "ggml.h"
+#ifndef __CUDACC_RTC__
 #include "ggml-impl.h"
 #include "ggml-cuda.h"
 
 #include <cstdint>
 #include <cstdlib>
 #include <memory>
+#else
+#include <cassert>
+#include <cstdint>
+#include <type_traits>
+#include <limits>
+#define GGML_PAD(x, n) (((x) + (n) - 1) & ~((n) - 1))
+#undef GGML_ASSERT
+#define GGML_ASSERT(x) assert(x)
+struct ggml_backend_cuda_context;
+#endif
 
 #if defined(GGML_USE_HIP)
 #define GGML_COMMON_DECL_HIP
@@ -21,6 +32,7 @@
 #endif
 #include "ggml-common.h"
 
+#ifndef __CUDACC_RTC__
 #include <array>
 #include <algorithm>
 #include <cassert>
@@ -30,11 +42,23 @@
 #include <unordered_map>
 #include <utility>
 #include <vector>
+#endif
 
 #if defined(GGML_USE_HIP)
 #include "vendors/hip.h"
 #elif defined(GGML_USE_MUSA)
 #include "vendors/musa.h"
+#elif defined(__CUDACC_RTC__)
+#include <cuda_device_runtime_api.h>
+#include <cuda_bf16.h>
+#include <cuda_fp16.h>
+#if CUDART_VERSION >= 11080
+#include <cuda_fp8.h>
+#define FP8_AVAILABLE
+#endif
+#if CUDART_VERSION >= 12080
+#include <cuda_fp4.h>
+#endif
 #else
 #include "vendors/cuda.h"
 #endif // defined(GGML_USE_HIP)
@@ -144,7 +168,7 @@ static __device__ __forceinline__ void ggml_cuda_pdl_lc() {
 #endif // defined(GGML_CUDA_USE_PDL) && __CUDA_ARCH__ >= GGML_CUDA_CC_HOPPER
 }
 
-#ifdef __CUDA_ARCH_LIST__
+#if defined(__CUDA_ARCH_LIST__) && !defined(GGML_CUDA_NVRTC)
 constexpr bool ggml_cuda_has_arch_impl(int) {
     return false;
 }
@@ -178,7 +202,7 @@ constexpr int ggml_cuda_highest_compiled_arch(const int arch) {
     return ggml_cuda_highest_compiled_arch_impl(arch, 0, __CUDA_ARCH_LIST__);
 }
 #else
-static int ggml_cuda_highest_compiled_arch(const int arch) {
+static __host__ __device__ int ggml_cuda_highest_compiled_arch(const int arch) {
     return arch;
 }
 #endif // __CUDA_ARCH_LIST__
@@ -189,6 +213,7 @@ static int ggml_cuda_highest_compiled_arch(const int arch) {
 
 #define GGML_CUDA_MAX_STREAMS 8
 
+#ifndef __CUDACC_RTC__
 [[noreturn]]
 void ggml_cuda_error(const char * stmt, const char * func, const char * file, int line, const char * msg);
 
@@ -255,6 +280,7 @@ static const char * cu_get_error_str(CUresult err) {
             GGML_UNUSED(nbytes);                         \
         } while (0)
 #endif // !defined(GGML_USE_HIP)
+#endif // !__CUDACC_RTC__
 
 #if CUDART_VERSION >= 11010 || defined(GGML_USE_MUSA)
 #define GGML_CUDA_ASSUME(x) __builtin_assume(x)
@@ -315,6 +341,7 @@ static const char * cu_get_error_str(CUresult err) {
 #define FLASH_ATTN_AVAILABLE
 #endif // !defined(GGML_CUDA_NO_FA) && !(defined(GGML_USE_MUSA) && __MUSA_ARCH__ < 220)
 
+#ifndef __CUDACC_RTC__
 static bool fp16_available(const int cc) {
     return ggml_cuda_highest_compiled_arch(cc) >= GGML_CUDA_CC_PASCAL ||
         (GGML_CUDA_CC_IS_MTHREADS(cc) && cc >= GGML_CUDA_CC_PH1);
@@ -400,6 +427,7 @@ static bool ggml_cuda_is_aligned(const ggml_tensor * tensor, const size_t alignm
            tensor->nb[2] % alignment == 0 &&
            tensor->nb[3] % alignment == 0;
 }
+#endif // !__CUDACC_RTC__
 
 static constexpr __device__ int ggml_cuda_get_physical_warp_size() {
 #if defined(GGML_USE_HIP) && (defined(__GFX9__) || defined(__GFX8__))
@@ -989,6 +1017,7 @@ __device__ __forceinline__ uint8_t ggml_cuda_float_to_fp4_e2m1(float x, float e)
 // and a shift:
 //
 // n/d = (mulhi(n, mp) + n) >> L;
+#ifndef __CUDACC_RTC__
 static const uint3 init_fastdiv_values(uint64_t d_64) {
     GGML_ASSERT(d_64 != 0);
     GGML_ASSERT(d_64 <= std::numeric_limits<uint32_t>::max());
@@ -1005,6 +1034,7 @@ static const uint3 init_fastdiv_values(uint64_t d_64) {
     // pack divisor as well to reduce error surface
     return make_uint3(mp, L, d);
 }
+#endif
 
 static __device__ __forceinline__ uint32_t fastdiv(uint32_t n, const uint3 fastdiv_values) {
     // expects fastdiv_values to contain <mp, L, divisor> in <x, y, z>
@@ -1241,6 +1271,7 @@ struct ggml_cuda_type_traits<GGML_TYPE_IQ3_S> {
 
 //////////////////////
 
+#ifndef __CUDACC_RTC__
 struct ggml_cuda_device_info {
     int device_count;           // number of (possibly virtual) devices exposed to the rest of ggml
     int physical_device_count;  // number of physical CUDA devices actually present
@@ -1353,6 +1384,9 @@ struct ggml_backend_cuda_context {
 #endif
 
     int curr_stream_no = 0;
+#ifdef GGML_CUDA_NVRTC
+    bool nvrtc_preparing = false;
+#endif
 
 #ifdef USE_CUDA_GRAPH
     // Map from first_node_ptr to cuda_graph - allows multiple graphs per context
@@ -1453,6 +1487,8 @@ struct ggml_cuda_mm_fusion_args_host {
     const ggml_tensor * shared_gate = nullptr;
     ggml_tensor * shared_dst = nullptr;
 };
+#endif // !__CUDACC_RTC__
+
 struct ggml_cuda_mm_fusion_args_device {
     const void * x_bias = nullptr;
     const void * gate = nullptr;
@@ -1467,6 +1503,7 @@ struct ggml_cuda_mm_fusion_args_device {
     uint32_t shared_stride_col_dst = 0;
 };
 
+#ifndef __CUDACC_RTC__
 struct ggml_cuda_kernel_launch_params {
     dim3 block_nums;
     dim3 block_dims;
@@ -1512,6 +1549,8 @@ bool ggml_cuda_kernel_can_use_pdl(const void * kernel);
 
 #endif //defined(GGML_CUDA_USE_PDL)
 
+#endif // !__CUDACC_RTC__
+
 // PDL and __restrict__ need to be mutually exclusive, see https://github.com/ggml-org/llama.cpp/pull/24030
 # if (defined(GGML_CUDA_USE_PDL) && __CUDA_ARCH__ >= GGML_CUDA_CC_HOPPER)
 # define GGML_CUDA_RESTRICT
@@ -1519,6 +1558,7 @@ bool ggml_cuda_kernel_can_use_pdl(const void * kernel);
 # define GGML_CUDA_RESTRICT __restrict__
 # endif // defined(GGML_CUDA_USE_PDL) && __CUDA_ARCH__ >= GGML_CUDA_CC_HOPPER
 
+#ifndef __CUDACC_RTC__
 template<typename Kernel, typename... Args>
 static __inline__ void ggml_cuda_kernel_launch(Kernel kernel, const ggml_cuda_kernel_launch_params & launch_params, Args&&... args) {
 #if defined(GGML_CUDA_USE_PDL)
@@ -1533,3 +1573,4 @@ static __inline__ void ggml_cuda_kernel_launch(Kernel kernel, const ggml_cuda_ke
     kernel<<<launch_params.block_nums, launch_params.block_dims, launch_params.shmem, launch_params.stream>>>(std::forward<Args>(args)... );
     CUDA_CHECK(cudaGetLastError());
 }
+#endif // !__CUDACC_RTC__

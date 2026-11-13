@@ -789,6 +789,23 @@ void llama_context::sched_reserve() {
     synchronize();
 
     const int64_t t_start_us = ggml_time_us();
+    if (const char * value = getenv("GGML_CUDA_NVRTC_VERBOSE")) {
+        if (value[0] != '0') {
+            LLAMA_LOG_INFO("NVRTC: graph preparation begins at %.3f s\n", t_start_us/1e6);
+        }
+    }
+
+    if (!model.no_alloc()) {
+        for (auto & backend : backends) {
+            auto * dev = ggml_backend_get_device(backend.get());
+            auto * reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
+            using prepare_begin_fn = void (*)(ggml_backend_t);
+            auto begin = reg ? (prepare_begin_fn) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_prepare_begin") : nullptr;
+            if (begin) {
+                begin(backend.get());
+            }
+        }
+    }
 
     const uint32_t n_seqs = cparams.n_seq_max;
     const uint32_t n_tokens = std::min(cparams.n_ctx, cparams.n_ubatch);
@@ -933,6 +950,21 @@ void llama_context::sched_reserve() {
                 val(n_splits_pp, n_splits_tg).c_str(),
                 val(n_inputs_pp, n_inputs_tg).c_str(),
                 val(n_input_tensors_pp, n_input_tensors_tg).c_str());
+    }
+
+    if (!model.no_alloc()) {
+        for (auto & backend : backends) {
+            ggml_backend_dev_t dev = ggml_backend_get_device(backend.get());
+            ggml_backend_reg_t reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
+            if (!reg) {
+                continue;
+            }
+            using prepare_wait_fn = bool (*)(ggml_backend_t);
+            auto prepare_wait = (prepare_wait_fn) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_prepare_wait");
+            if (prepare_wait && !prepare_wait(backend.get())) {
+                throw std::runtime_error(format("failed to prepare kernels for %s", ggml_backend_name(backend.get())));
+            }
+        }
     }
 
     const int64_t t_end_us = ggml_time_us();

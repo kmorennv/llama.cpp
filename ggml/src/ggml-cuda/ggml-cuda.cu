@@ -36,6 +36,7 @@
 #include "ggml-cuda/mmq.cuh"
 #include "ggml-cuda/mmvf.cuh"
 #include "ggml-cuda/mmvq.cuh"
+#include "ggml-cuda/nvrtc-kernels.cuh"
 #include "ggml-cuda/moe-weighted-reduction.cuh"
 #include "ggml-cuda/norm.cuh"
 #include "ggml-cuda/opt-step-adamw.cuh"
@@ -5413,7 +5414,30 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
         CUDA_CHECK(cudaStreamBeginCapture(cuda_ctx->stream(), cudaStreamCaptureModeRelaxed));
     }
 
-    ggml_cuda_graph_evaluate_and_capture(cuda_ctx, cgraph, use_cuda_graph, cuda_graph_update_required, graph_key);
+#ifdef GGML_CUDA_NVRTC
+    try {
+#endif
+        ggml_cuda_graph_evaluate_and_capture(cuda_ctx, cgraph, use_cuda_graph, cuda_graph_update_required, graph_key);
+#ifdef GGML_CUDA_NVRTC
+    } catch (const std::exception & error) {
+        GGML_LOG_ERROR("CUDA NVRTC execution failed: %s\n", error.what());
+        cuda_ctx->curr_stream_no = 0;
+#ifdef USE_CUDA_GRAPH
+        cudaStreamCaptureStatus capture;
+        if (cudaStreamIsCapturing(cuda_ctx->stream(), &capture) == cudaSuccess && capture != cudaStreamCaptureStatusNone) {
+            cudaGraph_t failed = nullptr;
+            cudaStreamEndCapture(cuda_ctx->stream(), &failed);
+            if (failed) {
+                cudaGraphDestroy(failed);
+            }
+            if (ggml_cuda_lock_counter.fetch_sub(1, std::memory_order_relaxed) == 1) {
+                ggml_cuda_lock_cv.notify_all();
+            }
+        }
+#endif
+        return GGML_STATUS_FAILED;
+    }
+#endif
 
     return GGML_STATUS_SUCCESS;
 }
@@ -5445,6 +5469,27 @@ static void ggml_backend_cuda_event_wait(ggml_backend_t backend, ggml_backend_ev
 
 static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph * cgraph, ggml_backend_graph_optimize_params * params) {
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
+
+#ifdef GGML_CUDA_NVRTC
+    for (int i = 0; cuda_ctx->nvrtc_preparing && i < cgraph->n_nodes; ++i) {
+        const ggml_tensor * node = cgraph->nodes[i];
+        const ggml_tensor * weight = node->src[0];
+        if (!weight) {
+            continue;
+        }
+        if (node->op == GGML_OP_MUL_MAT || node->op == GGML_OP_MUL_MAT_ID) {
+            if (ggml_is_quantized(weight->type)) {
+                ggml_cuda_nvrtc_mmq_prepare(cuda_ctx->device, weight->type, weight->ne[0], weight->ne[1]);
+                ggml_cuda_nvrtc_mmvq_prepare(cuda_ctx->device, weight->type, weight->ne[0], node->op == GGML_OP_MUL_MAT_ID);
+            } else {
+                ggml_cuda_nvrtc_mmf_prepare(cuda_ctx->device, node);
+                ggml_cuda_nvrtc_mmvf_prepare(cuda_ctx->device, weight, node->op == GGML_OP_MUL_MAT_ID);
+            }
+        } else if (node->op == GGML_OP_FLASH_ATTN_EXT) {
+            ggml_cuda_nvrtc_fattn_prepare(cuda_ctx->device, node);
+        }
+    }
+#endif
 
     const bool disable_fusion = ggml_cuda_fusion_disabled();
 
@@ -6789,8 +6834,89 @@ static ggml_backend_feature * ggml_backend_cuda_get_features(ggml_backend_reg_t 
     GGML_UNUSED(reg);
 }
 
+#ifdef GGML_CUDA_NVRTC
+static bool ggml_cuda_nvrtc_aot_arch_supported(int device) {
+    const int cc = ggml_cuda_info().devices[device].cc;
+#if defined(__CUDA_ARCH_LIST__)
+    const int compiled_arches[] = { __CUDA_ARCH_LIST__ };
+    for (int arch : compiled_arches) {
+        if (arch == cc) {
+            return true;
+        }
+    }
+#endif
+    GGML_LOG_ERROR("NVRTC: CUDA%d requires an exact AOT target for utility kernels; rebuild with -DCMAKE_CUDA_ARCHITECTURES=%d\n", device, cc / 10);
+    return false;
+}
+
+static bool ggml_backend_cuda_prepare_fattn(ggml_backend_dev_t dev, int DKQ, int DV, bool use_softcap) {
+    try {
+        auto * ctx = (ggml_backend_cuda_device_context *) dev->context;
+        if (!ggml_cuda_nvrtc_aot_arch_supported(ctx->device)) {
+            return false;
+        }
+        ggml_cuda_nvrtc_fattn_prepare_mma(ctx->device, DKQ, DV, use_softcap);
+        return true;
+    } catch (const std::exception & error) {
+        GGML_LOG_ERROR("NVRTC FlashAttention preparation failed on %s: %s\n", ggml_backend_dev_name(dev), error.what());
+        return false;
+    }
+}
+
+static bool ggml_backend_cuda_prepare_tensor(ggml_backend_dev_t dev, const ggml_tensor * tensor) {
+    try {
+        auto * ctx = (ggml_backend_cuda_device_context *) dev->context;
+        if (!ggml_cuda_nvrtc_aot_arch_supported(ctx->device)) {
+            return false;
+        }
+        if (ggml_is_quantized(tensor->type) && tensor->ne[1] > 1) {
+            ggml_cuda_nvrtc_mmq_prepare(ctx->device, tensor->type, tensor->ne[0], tensor->ne[1]);
+            ggml_cuda_nvrtc_mmvq_prepare(ctx->device, tensor->type, tensor->ne[0], tensor->ne[2] > 1);
+        } else if (!ggml_is_quantized(tensor->type) && tensor->ne[1] > 1) {
+            ggml_cuda_nvrtc_mmvf_prepare(ctx->device, tensor, tensor->ne[2] > 1, true);
+        }
+        return true;
+    } catch (const std::exception & error) {
+        GGML_LOG_ERROR("NVRTC preparation failed for %s: %s\n", tensor->name, error.what());
+        return false;
+    }
+}
+
+static bool ggml_backend_cuda_prepare_wait(ggml_backend_t backend) {
+    auto * ctx = (ggml_backend_cuda_context *) backend->context;
+    const bool result = ggml_cuda_nvrtc_wait(ctx->device);
+    ctx->nvrtc_preparing = false;
+    return result;
+}
+
+static void ggml_backend_cuda_prepare_begin(ggml_backend_t backend) {
+    auto * ctx = (ggml_backend_cuda_context *) backend->context;
+    ctx->nvrtc_preparing = true;
+}
+#endif
+
 static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
     GGML_UNUSED(reg);
+#ifdef GGML_CUDA_NVRTC
+    if (strcmp(name, "ggml_backend_cuda_nvrtc_compilation_count") == 0) {
+        return (void *) ggml_cuda_nvrtc_compilation_count;
+    }
+    if (strcmp(name, "ggml_backend_cuda_nvrtc_cache_hit_count") == 0) {
+        return (void *) ggml_cuda_nvrtc_cache_hit_count;
+    }
+    if (strcmp(name, "ggml_backend_cuda_prepare_fattn") == 0) {
+        return (void *) ggml_backend_cuda_prepare_fattn;
+    }
+    if (strcmp(name, "ggml_backend_cuda_prepare_tensor") == 0) {
+        return (void *) ggml_backend_cuda_prepare_tensor;
+    }
+    if (strcmp(name, "ggml_backend_cuda_prepare_wait") == 0) {
+        return (void *) ggml_backend_cuda_prepare_wait;
+    }
+    if (strcmp(name, "ggml_backend_cuda_prepare_begin") == 0) {
+        return (void *) ggml_backend_cuda_prepare_begin;
+    }
+#endif
     if (strcmp(name, "ggml_backend_comm_init") == 0) {
         return (void *)ggml_backend_cuda_comm_init;
     }
@@ -6885,6 +7011,12 @@ ggml_backend_t ggml_backend_cuda_init(int device) {
         GGML_LOG_ERROR("%s: invalid device %d\n", __func__, device);
         return nullptr;
     }
+
+#ifdef GGML_CUDA_NVRTC
+    if (!ggml_cuda_nvrtc_aot_arch_supported(device)) {
+        return nullptr;
+    }
+#endif
 
     ggml_backend_cuda_context * ctx = new ggml_backend_cuda_context(device);
     if (ctx == nullptr) {

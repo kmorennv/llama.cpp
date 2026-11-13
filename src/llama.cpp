@@ -156,6 +156,14 @@ int64_t llama_time_us(void) {
 
 // returns true on success
 static bool llama_prepare_model_devices(const llama_model_params & params, llama_model * model) {
+    auto can_use_tensor_parallelism = [](ggml_backend_dev_t dev) {
+        ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+        if (reg && ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_prepare_tensor")) {
+            LLAMA_LOG_ERROR("CUDA NVRTC kernel preparation does not support tensor parallelism\n");
+            return false;
+        }
+        return true;
+    };
     // create list of devices to use with this model
     if (params.devices) {
         if (params.split_mode == LLAMA_SPLIT_MODE_TENSOR) {
@@ -169,6 +177,9 @@ static bool llama_prepare_model_devices(const llama_model_params & params, llama
             }
             LLAMA_LOG_INFO("%s: creating a Meta device with %zu devices\n", __func__, n_devs);
             for (size_t i = 0; i < n_devs; ++i) {
+                if (!can_use_tensor_parallelism(params.devices[i])) {
+                    return false;
+                }
                 LLAMA_LOG_INFO("%s: - device %zu: %s\n", __func__, i, ggml_backend_dev_name(params.devices[i]));
             }
             model->get_split_state_ud.n_devices = n_devs;
@@ -208,6 +219,9 @@ static bool llama_prepare_model_devices(const llama_model_params & params, llama
 
             LLAMA_LOG_INFO("%s: creating a Meta device for tensor parallelism from %zu devices:\n", __func__, devs.size());
             for (size_t i = 0; i < devs.size(); ++i) {
+                if (!can_use_tensor_parallelism(devs[i])) {
+                    return false;
+                }
                 LLAMA_LOG_INFO("%s: - device %zu: %s (%s)\n", __func__, i, ggml_backend_dev_name(devs[i]), ggml_backend_dev_description(devs[i]));
             }
 
@@ -301,6 +315,12 @@ static bool llama_prepare_model_devices(const llama_model_params & params, llama
     }
 
     for (const auto & dev : model->devices) {
+        ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev.dev);
+        if (params.split_mode == LLAMA_SPLIT_MODE_ROW && reg &&
+            ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_prepare_tensor")) {
+            LLAMA_LOG_ERROR("CUDA NVRTC kernel preparation does not support row splitting\n");
+            return false;
+        }
         ggml_backend_dev_props props;
         ggml_backend_dev_get_props(dev.dev, &props);
         LLAMA_LOG_INFO("%s: using device %s (%s) (%s) - %zu MiB free\n", __func__,

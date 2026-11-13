@@ -2,6 +2,7 @@
 
 #define MMVF_MAX_BATCH_SIZE 8 // Max. batch size for which to use MMVF kernels.
 
+#ifndef __CUDACC_RTC__
 void ggml_cuda_mul_mat_vec_f(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst,
     const ggml_cuda_mm_fusion_args_host * fusion = nullptr);
 
@@ -12,3 +13,8 @@ void ggml_cuda_op_mul_mat_vec_f(
     const int64_t src1_padded_row_size, cudaStream_t stream);
 
 bool ggml_cuda_should_use_mmvf(const ggml_tensor * src0, int cc, int warp_size, int64_t ne11);
+
+#ifdef GGML_CUDA_NVRTC
+void ggml_cuda_nvrtc_mmvf_prepare(int device, const ggml_tensor * weight, bool has_ids = false, bool static_weight = false);
+#endif
+#endif // !__CUDACC_RTC__

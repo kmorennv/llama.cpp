@@ -30,12 +30,15 @@
 #include <cfloat>
 #include <cstdint>
 #include <cstring>
+#include <cstdlib>
 #include <cmath>
 #include <functional>
 #include <map>
 #include <numeric>
 #include <regex>
 #include <sstream>
+#include <set>
+#include <tuple>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -1372,6 +1375,7 @@ struct llama_model::impl {
     std::vector<layer_dev> dev_layer;
 
     bool has_tensor_overrides;
+    bool prepare_flash_attn = false;
 
     std::vector<float> tensor_split_owned;
 };
@@ -1427,6 +1431,12 @@ void llama_prec_policy::load(llama_model_loader & ml, const llama_model & model)
 }
 
 llama_model::llama_model(const llama_model_params & params) : params(params), pimpl(std::make_unique<impl>()) {
+    if (const auto * context = params.prepare_context) {
+        pimpl->prepare_flash_attn = context->flash_attn_type == LLAMA_FLASH_ATTN_TYPE_ENABLED &&
+            context->offload_kqv && context->op_offload && context->ctx_other == nullptr &&
+            context->ctx_type == LLAMA_CONTEXT_TYPE_DEFAULT;
+    }
+    this->params.prepare_context = nullptr;
     if (params.tensor_split != nullptr) {
         // llama_model_params stores tensor_split as a borrowed pointer, but the model
         // may need it later for tensor-parallel KV-cache split metadata.
@@ -1997,6 +2007,58 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     // per-tensor activation precision policy
     prec_policy.load(ml, *this);
 
+    // Start the longest attention jobs before the tensor jobs enter the FIFO queue.
+    if (!ml.no_alloc && pimpl->prepare_flash_attn && can_prepare_fattn()) {
+        using prepare_fattn_fn = bool (*)(ggml_backend_dev_t, int, int, bool);
+        std::set<std::tuple<ggml_backend_dev_t, uint32_t, uint32_t>> prepared;
+        for (uint32_t il = 0; il < hparams.n_layer(); ++il) {
+            if (hparams.is_recr(il) || hparams.n_head(il) == 0 || hparams.n_head_kv(il) == 0) {
+                continue;
+            }
+            auto * dev = dev_layer(il);
+            auto * reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
+            auto prepare = reg ? (prepare_fattn_fn) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_prepare_fattn") : nullptr;
+            const uint32_t dkq = hparams.n_embd_head_k(il);
+            const uint32_t dv = hparams.n_embd_head_v(il);
+            if (!prepare || !prepared.emplace(dev, dkq, dv).second) {
+                continue;
+            }
+            const bool softcap = hparams.attn_soft_cap && hparams.f_attn_logit_softcapping != 0.0f;
+            if (!prepare(dev, dkq, dv, softcap)) {
+                throw std::runtime_error(format("failed to prepare attention kernels on %s", ggml_backend_dev_name(dev)));
+            }
+        }
+    }
+
+    // start compilation before checkpoint prefetch and uploads
+    if (!ml.no_alloc) {
+        for (const auto & [ctx_key, ctx_ptr] : ml.ctx_map) {
+            if (ggml_backend_buft_is_host(ctx_key.buft)) {
+                continue;
+            }
+            ggml_backend_dev_t dev = ggml_backend_buft_get_device(ctx_key.buft);
+            ggml_backend_reg_t reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
+            if (!reg) {
+                continue;
+            }
+            using prepare_tensor_fn = bool (*)(ggml_backend_dev_t, const ggml_tensor *);
+            auto prepare_tensor = (prepare_tensor_fn) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_prepare_tensor");
+            if (!prepare_tensor) {
+                continue;
+            }
+            for (ggml_tensor * t = ggml_get_first_tensor(ctx_ptr.get()); t != nullptr; t = ggml_get_next_tensor(ctx_ptr.get(), t)) {
+                if (!prepare_tensor(dev, t)) {
+                    throw std::runtime_error(format("failed to prepare kernels for tensor '%s' on %s", t->name, ggml_backend_dev_name(dev)));
+                }
+            }
+        }
+    }
+
+    const char * nvrtc_verbose = std::getenv("GGML_CUDA_NVRTC_VERBOSE");
+    const bool log_preparation = nvrtc_verbose && nvrtc_verbose[0] != '0';
+    if (log_preparation) {
+        LLAMA_LOG_INFO("NVRTC: checkpoint loading begins at %.3f s\n", ggml_time_us()/1e6);
+    }
     ml.init_mappings(true, use_mlock ? &pimpl->mlock_mmaps : nullptr);
     pimpl->mappings.reserve(ml.mappings.size());
 
@@ -2155,6 +2217,10 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     }
 
     load_tensors_hadamard();
+
+    if (log_preparation) {
+        LLAMA_LOG_INFO("NVRTC: checkpoint loading ends at %.3f s\n", ggml_time_us()/1e6);
+    }
 
     return true;
 }
@@ -3551,6 +3617,7 @@ llama_model_params llama_model_default_params() {
         /*.progress_callback           =*/ nullptr,
         /*.progress_callback_user_data =*/ nullptr,
         /*.kv_overrides                =*/ nullptr,
+        /*.prepare_context             =*/ nullptr,
         /*.vocab_only                  =*/ false,
         /*.check_tensors               =*/ false,
         /*.use_extra_bufts             =*/ true,

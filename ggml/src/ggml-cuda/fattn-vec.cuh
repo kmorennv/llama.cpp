@@ -1,10 +1,12 @@
 #include "common.cuh"
 #include "fattn-common.cuh"
 
+#ifndef __CUDACC_RTC__
 static int ggml_cuda_fattn_vec_get_nthreads_host(const int cc) {
     return 128;
     GGML_UNUSED(cc);
 }
+#endif
 
 static constexpr __device__ int ggml_cuda_fattn_vec_get_nthreads_device() {
     return 128;
@@ -553,13 +555,14 @@ static __global__ void flash_attn_ext_vec(
 #pragma clang diagnostic pop
 #endif // __clang__
 
+#ifndef __CUDACC_RTC__
 template <int D, int cols_per_block, ggml_type type_K, ggml_type type_V, bool use_logit_softcap>
 void ggml_cuda_flash_attn_ext_vec_case_impl(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
 
     const int nthreads = ggml_cuda_fattn_vec_get_nthreads_host(cc);
     const int nwarps   = nthreads / WARP_SIZE;
-    fattn_kernel_t fattn_kernel = flash_attn_ext_vec<D, cols_per_block, type_K, type_V, use_logit_softcap>;
+    fattn_kernel_t fattn_kernel = GGML_CUDA_FATTN_KERNEL("fattn-vec.cuh", flash_attn_ext_vec, D, cols_per_block, type_K, type_V, use_logit_softcap);
     const bool need_f16_K = type_K == GGML_TYPE_F16;
     const bool need_f16_V = type_V == GGML_TYPE_F16;
     constexpr size_t nbytes_shared = 0;
@@ -600,6 +603,7 @@ void ggml_cuda_flash_attn_ext_vec_case(ggml_backend_cuda_context & ctx, ggml_ten
     template void ggml_cuda_flash_attn_ext_vec_case                         \
     <D, type_K, type_V>(ggml_backend_cuda_context & ctx, ggml_tensor * dst) \
 
+#ifndef GGML_CUDA_NVRTC
 #define EXTERN_DECL_FATTN_VEC_CASES(D, type_K)             \
     extern DECL_FATTN_VEC_CASE(D, type_K, GGML_TYPE_F16);  \
     extern DECL_FATTN_VEC_CASE(D, type_K, GGML_TYPE_Q4_0); \
@@ -636,3 +640,5 @@ EXTERN_DECL_FATTN_VEC_CASES(256, GGML_TYPE_Q5_1)
 EXTERN_DECL_FATTN_VEC_CASES(256, GGML_TYPE_Q8_0)
 EXTERN_DECL_FATTN_VEC_CASES(256, GGML_TYPE_BF16)
 EXTERN_DECL_FATTN_VEC_CASES(256, GGML_TYPE_F8_E4M3)
+#endif // GGML_CUDA_NVRTC
+#endif // __CUDACC_RTC__

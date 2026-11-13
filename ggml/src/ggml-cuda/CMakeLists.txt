@@ -116,6 +116,10 @@ if (CUDAToolkit_FOUND)
 
     file(GLOB   GGML_SOURCES_CUDA "*.cu")
 
+    if (NOT GGML_CUDA_NVRTC)
+        list(FILTER GGML_SOURCES_CUDA EXCLUDE REGEX "/(fattn-launch|nvrtc-kernels)\\.cu$")
+    endif()
+
     file(GLOB   SRCS "template-instances/fattn-tile*.cu")
     list(APPEND GGML_SOURCES_CUDA ${SRCS})
     file(GLOB   SRCS "template-instances/fattn-mma*.cu")
@@ -128,10 +132,37 @@ if (CUDAToolkit_FOUND)
     ggml_cuda_fattn_vec_instances(${CMAKE_CURRENT_SOURCE_DIR} SRCS)
     list(APPEND GGML_SOURCES_CUDA ${SRCS})
 
+    if (GGML_CUDA_NVRTC)
+        if (NOT CMAKE_SYSTEM_NAME STREQUAL "Linux" OR CUDAToolkit_VERSION VERSION_LESS "12.3")
+            message(FATAL_ERROR "GGML_CUDA_NVRTC requires Linux and CUDA 12.3 or newer")
+        endif()
+        list(FILTER GGML_SOURCES_CUDA EXCLUDE REGEX "/template-instances/")
+        find_package(Python3 REQUIRED COMPONENTS Interpreter)
+        file(GLOB NVRTC_INPUTS CONFIGURE_DEPENDS "*.cuh" "*.cu" "../*.h" "../../include/*.h")
+        add_custom_command(OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/nvrtc-sources.h"
+            COMMAND Python3::Interpreter "${CMAKE_CURRENT_SOURCE_DIR}/generate_nvrtc_sources.py"
+                --root "${CMAKE_CURRENT_SOURCE_DIR}/../.."
+                --output "${CMAKE_CURRENT_BINARY_DIR}/nvrtc-sources.h"
+            DEPENDS ${NVRTC_INPUTS} "${CMAKE_CURRENT_SOURCE_DIR}/generate_nvrtc_sources.py"
+            VERBATIM)
+        list(APPEND GGML_SOURCES_CUDA "${CMAKE_CURRENT_BINARY_DIR}/nvrtc-sources.h")
+    endif()
+
     ggml_add_backend_library(ggml-cuda
                              ${GGML_HEADERS_CUDA}
                              ${GGML_SOURCES_CUDA}
                             )
+
+    if (GGML_CUDA_NVRTC)
+        math(EXPR NVRTC_CUDART_VERSION "${CUDAToolkit_VERSION_MAJOR} * 1000 + ${CUDAToolkit_VERSION_MINOR} * 10")
+        list(GET CUDAToolkit_INCLUDE_DIRS 0 NVRTC_CUDA_INCLUDE)
+        target_include_directories(ggml-cuda PRIVATE "${CMAKE_CURRENT_BINARY_DIR}")
+        target_compile_definitions(ggml-cuda PRIVATE GGML_CUDA_NVRTC
+            GGML_NVRTC_CUDART_VERSION="${NVRTC_CUDART_VERSION}"
+            GGML_NVRTC_CUDA_INCLUDE="${NVRTC_CUDA_INCLUDE}"
+            GGML_NVRTC_OPTIONS_ID="c++17-fastmath-${CUDAToolkit_VERSION}")
+        target_link_libraries(ggml-cuda PRIVATE CUDA::nvrtc CUDA::cuda_driver)
+    endif()
 
     option(GGML_CUDA_UNITY_BUILD "Use unity builds for CUDA sources" "${CMAKE_UNITY_BUILD}")
     set_target_properties(ggml-cuda PROPERTIES UNITY_BUILD "${GGML_CUDA_UNITY_BUILD}")

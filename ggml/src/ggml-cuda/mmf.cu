@@ -1,4 +1,5 @@
 #include "ggml.h"
+#include "ggml-backend.h"
 #include "mmf.cuh"
 #include "mmid.cuh"
 
@@ -9,6 +10,47 @@ static __forceinline__ int mmf_get_rows_per_block(const int cc) {
         return MMF_ROWS_PER_BLOCK;
     }
 }
+
+#ifdef GGML_CUDA_NVRTC
+void ggml_cuda_nvrtc_mmf_prepare(int device, const ggml_tensor * dst) {
+    const ggml_tensor * src0 = dst->src[0];
+    const bool has_ids = dst->op == GGML_OP_MUL_MAT_ID;
+    const auto & info = ggml_cuda_info().devices[device];
+    if (!ggml_cuda_should_use_mmf(src0->type, info.cc, info.warp_size, src0->ne, src0->nb, 1, has_ids)) {
+        return;
+    }
+    const char * type = src0->type == GGML_TYPE_F32 ? "float" : src0->type == GGML_TYPE_F16 ? "half2" : "nv_bfloat162";
+    const int vals_per_type = src0->type == GGML_TYPE_F32 ? 1 : 2;
+    const int64_t ncols_x = src0->ne[0]/vals_per_type;
+    std::vector<int> warp_choices = { mmf_get_nwarps(ncols_x, info.warp_size, info.cc) };
+    const ggml_tensor * base = src0->view_src ? src0->view_src : src0;
+    if (!base->buffer || ggml_backend_buffer_get_usage(base->buffer) != GGML_BACKEND_BUFFER_USAGE_WEIGHTS) {
+        // Activations can have a shorter reduction dimension than the reserved graph.
+        const int64_t limit = std::min<int64_t>(ncols_x, 2*mmf_get_max_block_size(info.cc));
+        for (int64_t cols = info.warp_size; cols <= limit; cols += info.warp_size) {
+            const int nwarps = mmf_get_nwarps(cols, info.warp_size, info.cc);
+            if (std::find(warp_choices.begin(), warp_choices.end(), nwarps) == warp_choices.end()) {
+                warp_choices.push_back(nwarps);
+            }
+        }
+    }
+    const int rows = mmf_get_rows_per_block(info.cc);
+    std::vector<std::string> expressions;
+    for (int nwarps : warp_choices) {
+        for (int cols = 1; cols <= MMF_IDS_COLS_PER_BLOCK; ++cols) {
+            expressions.push_back(mmf_nvrtc_expression("mul_mat_f", type, rows, cols, nwarps, has_ids ? ",true" : ",false"));
+            ggml_cuda_nvrtc_require_shared(device, "mmf.cuh", expressions.back(),
+                mmf_get_nbytes_shared(rows, cols, nwarps, has_ids, info.warp_size, info.cc));
+        }
+        if (has_ids) {
+            expressions.push_back(mmf_nvrtc_expression("mul_mat_f_ids", type, rows, MMF_IDS_COLS_PER_BLOCK, nwarps));
+            ggml_cuda_nvrtc_require_shared(device, "mmf.cuh", expressions.back(),
+                mmf_get_nbytes_shared(rows, MMF_IDS_COLS_PER_BLOCK, nwarps, true, info.warp_size, info.cc));
+        }
+    }
+    ggml_cuda_nvrtc_enqueue(device, "mmf.cuh", expressions);
+}
+#endif
 
 void ggml_cuda_mul_mat_f(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst) {
     GGML_ASSERT(        src1->type == GGML_TYPE_F32);

@@ -5,7 +5,128 @@
 
 #include <cstdint>
 
+#ifdef GGML_CUDA_NVRTC
+#include <mutex>
+
+struct mmq_nvrtc_recipe {
+    std::once_flag init;
+    std::string main;
+    std::string fixup;
+};
+
+static const mmq_nvrtc_recipe & mmq_nvrtc_recipe_for(ggml_type type, int J, bool fallback, ggml_prec precision, bool fusion) {
+    GGML_ASSERT(type >= 0 && type < GGML_TYPE_COUNT && J >= 8 && J <= 128 && J % 8 == 0);
+    static mmq_nvrtc_recipe recipes[GGML_TYPE_COUNT * 16 * 2 * 2 * 2];
+    const int index = ((((int(type) * 16 + J/8 - 1) * 2 + fallback) * 2 + (precision == GGML_PREC_Q4)) * 2 + fusion);
+    auto & recipe = recipes[index];
+    std::call_once(recipe.init, [&] {
+        recipe.main = ggml_cuda_mmq_kernel_expression("mul_mat_q", type, J, fallback, precision, fusion);
+        recipe.fixup = ggml_cuda_mmq_kernel_expression("mul_mat_q_stream_k_fixup", type, J, fallback, precision);
+    });
+    return recipe;
+}
+
+static void launch_mul_mat_q_nvrtc(ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream,
+        ggml_type type, int J, bool fallback, ggml_prec prec_src1, bool has_fusion) {
+    const int id = ggml_cuda_get_device();
+    const int cc = ggml_cuda_info().devices[id].cc;
+    const int nsm = ggml_cuda_info().devices[id].nsm;
+    const int warp_size = ggml_cuda_info().devices[id].warp_size;
+
+    const ggml_cuda_mmq_config config = ggml_cuda_mmq_get_config(type, J, fallback, cc, prec_src1);
+    GGML_ASSERT(config.nthreads % warp_size == 0);
+    const int nwarps = config.nthreads / warp_size;
+    const int nbytes_shared = mmq_get_nbytes_shared(config, cc);
+
+    const dim3 block_dims(warp_size, nwarps, 1);
+
+    const auto & recipe = mmq_nvrtc_recipe_for(type, J, fallback, prec_src1, has_fusion);
+    const std::string & expression = recipe.main;
+
+    const int I_dst = has_fusion ? config.I/2 : config.I; // Rows of dst per tile, see mul_mat_q.
+    const int nti   = (args.nrows_x + I_dst - 1) / I_dst;
+    const int ntzw  = args.nchannels_y * args.nsamples_y;
+    // Column tiles innermost so that the concurrently running blocks share the same tile of x and read it from L2.
+    const dim3 block_nums_xy_tiling(args.ntj, nti, ntzw);
+
+    GGML_ASSERT(args.ids_dst || args.nchannels_y % args.nchannels_x == 0);
+    GGML_ASSERT(                args.nsamples_y  % args.nsamples_x  == 0);
+    const int channel_ratio = args.ids_dst ? 1 : args.nchannels_y / args.nchannels_x;
+    const int sample_ratio  =                    args.nsamples_y  / args.nsamples_x;
+
+    const uint3 blocks_per_ne00_fd = init_fastdiv_values(args.ncols_x / ggml_blck_size(type));
+    const uint3 ntj_fd             = init_fastdiv_values(args.ntj);
+    const uint3 nchannels_y_fd     = init_fastdiv_values(args.nchannels_y);
+    const uint3 nsamples_y_fd      = init_fastdiv_values(args.nsamples_y);
+    const uint3 channel_ratio_fd   = init_fastdiv_values(channel_ratio);
+    const uint3 sample_ratio_fd    = init_fastdiv_values(sample_ratio);
+
+    if (has_fusion || !config.stream_k) {
+        GGML_ASSERT(nti <= 65535); // gridDim.y limit
+        ggml_cuda_nvrtc_launch("mmq.cuh", expression,
+            ggml_cuda_kernel_launch_params(block_nums_xy_tiling, block_dims, nbytes_shared, stream), nbytes_shared, false,
+             args.x, (const char *) args.fusion.gate, args.y, args.ids_dst, args.tile_spec, args.dst, (float *) nullptr,
+             args.y_scale, args.fusion.glu_op, args.fusion.glu_limit, (const float *) args.fusion.x_scale, (const float *) args.fusion.gate_scale,
+             blocks_per_ne00_fd, (int) args.nrows_x, (int) args.ncols_dst, (int) args.stride_row_x, (int) args.ncols_y, (int) args.nrows_dst,
+             channel_ratio_fd, nchannels_y_fd, (int) args.stride_channel_x, (int) args.stride_channel_y, (int) args.stride_channel_dst,
+             sample_ratio_fd, nsamples_y_fd, (int) args.stride_sample_x, (int) args.stride_sample_y, (int) args.stride_sample_dst,
+             ntj_fd);
+        return;
+    }
+
+    // For the stream-k kernel it is possible to run it with tiling by setting the number of CUDA blocks equal to the number of tiles.
+    // This is worthwhile if the efficiency of tiling is high and skipping the fixup kernel is more important.
+    const int ntiles_dst = args.ntj * nti * ntzw;
+    const int tiles_nwaves = (ntiles_dst + nsm - 1) / nsm;
+    const int tiles_efficiency_percent = 100 * ntiles_dst / (nsm*tiles_nwaves);
+
+    GGML_ASSERT(ntiles_dst * blocks_per_ne00_fd.z < (1 << 30)); // Assert that variable kbc will not overflow.
+
+    const int nwork = ntiles_dst * ((args.ncols_x + config.K_vram - 1) / config.K_vram); // Maximum number of CUDA blocks that can do useful work.
+    const dim3 block_nums_stream_k(GGML_CUDA_CC_IS_NVIDIA(cc) && tiles_efficiency_percent >= 90 ? ntiles_dst : std::min(nsm, nwork), 1, 1);
+
+    const bool fixup_needed = ntiles_dst % block_nums_stream_k.x != 0;
+
+    ggml_cuda_pool & pool = ctx.pool(id);
+    ggml_cuda_pool_alloc<float> tmp_fixup(pool);
+    if (fixup_needed) {
+        tmp_fixup.alloc(block_nums_stream_k.x * config.J*config.I);
+    }
+
+    const dim3 block_nums_fixup(block_nums_stream_k.x, config.I/warp_size, 1);
+    const dim3 block_dims_fixup(block_dims.x, block_dims.y/2, block_dims.z);
+
+    ggml_cuda_nvrtc_launch("mmq.cuh", expression,
+        ggml_cuda_kernel_launch_params(block_nums_stream_k, block_dims, nbytes_shared, stream), nbytes_shared, false,
+         args.x, (const char *) args.fusion.gate, args.y, args.ids_dst, args.tile_spec, args.dst, tmp_fixup.ptr,
+         args.y_scale, args.fusion.glu_op, args.fusion.glu_limit, (const float *) args.fusion.x_scale, (const float *) args.fusion.gate_scale,
+         blocks_per_ne00_fd, (int) args.nrows_x, (int) args.ncols_dst, (int) args.stride_row_x, (int) args.ncols_y, (int) args.nrows_dst,
+         channel_ratio_fd, nchannels_y_fd, (int) args.stride_channel_x, (int) args.stride_channel_y, (int) args.stride_channel_dst,
+         sample_ratio_fd, nsamples_y_fd, (int) args.stride_sample_x, (int) args.stride_sample_y, (int) args.stride_sample_dst,
+         ntj_fd);
+
+    if (!fixup_needed) {
+        return;
+    }
+
+    CUDA_CHECK(cudaGetLastError());
+    const std::string & fixup_expression = recipe.fixup;
+    ggml_cuda_nvrtc_launch("mmq.cuh", fixup_expression,
+        ggml_cuda_kernel_launch_params(block_nums_fixup, block_dims_fixup, 0, stream), 0, false,
+         args.ids_dst, args.tile_spec, args.dst, tmp_fixup.ptr, blocks_per_ne00_fd, (int) args.nrows_x, (int) args.ncols_dst,
+         (int) args.nrows_dst, nchannels_y_fd, (int) args.stride_channel_dst, nsamples_y_fd, (int) args.stride_sample_dst,
+         ntj_fd);
+}
+
+#endif
+
 static void ggml_cuda_mul_mat_q_switch_type(ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream, const ggml_prec prec_src1) {
+#ifdef GGML_CUDA_NVRTC
+    const bool fallback = ggml_cuda_mmq_needs_fallback(args.nrows_x);
+    const bool fusion = args.fusion.gate != nullptr;
+    GGML_ASSERT(!fusion || (!fallback && ggml_cuda_mmq_fusion_supported(args.type_x)));
+    launch_mul_mat_q_nvrtc(ctx, args, stream, args.type_x, args.J_best, fallback, prec_src1, fusion);
+#else
     switch (args.type_x) {
         case GGML_TYPE_Q1_0:
             mul_mat_q_case<GGML_TYPE_Q1_0, GGML_PREC_Q8>(ctx, args, stream);
@@ -88,6 +209,7 @@ static void ggml_cuda_mul_mat_q_switch_type(ggml_backend_cuda_context & ctx, con
         default:
             GGML_ABORT("fatal error");
     }
+#endif
 }
 
 // overrides the src1 precision requested by the graph, "auto" keeps the requested one
@@ -130,6 +252,47 @@ static ggml_prec ggml_cuda_mmq_get_prec_src1(const ggml_type type, const ggml_pr
     }
     return GGML_PREC_Q4;
 }
+
+#ifdef GGML_CUDA_NVRTC
+void ggml_cuda_nvrtc_mmq_prepare(int device, ggml_type type, int64_t ncols_x, int64_t nrows_x) {
+    if (ncols_x <= 0 || nrows_x <= 0) {
+        return;
+    }
+
+    const auto & info = ggml_cuda_info().devices[device];
+    const bool fallback = ggml_cuda_mmq_needs_fallback(nrows_x);
+    std::vector<std::string> expressions;
+    ggml_prec previous_prec = GGML_PREC_UNDEFINED;
+    for (ggml_prec requested : { GGML_PREC_Q8, GGML_PREC_Q4 }) {
+        const ggml_prec prec = ggml_cuda_mmq_get_prec_src1(type, requested, info.cc);
+        if (prec == previous_prec) {
+            continue;
+        }
+        previous_prec = prec;
+        for (int J = 8; J <= 128; J += 8) {
+            const ggml_cuda_mmq_config config = ggml_cuda_mmq_get_config(type, J, fallback, info.cc, prec);
+            if (config.type == GGML_TYPE_COUNT || mmq_get_nbytes_shared(config, info.cc) > info.smpbo) {
+                continue;
+            }
+            const int shared = (int) mmq_get_nbytes_shared(config, info.cc);
+            const std::string expression = mmq_nvrtc_recipe_for(type, J, fallback, prec, false).main;
+            ggml_cuda_nvrtc_require_shared(device, "mmq.cuh", expression, shared);
+            expressions.push_back(expression);
+            if (config.stream_k) {
+                expressions.push_back(mmq_nvrtc_recipe_for(type, J, fallback, prec, false).fixup);
+            }
+            if (!fallback && ggml_cuda_mmq_fusion_supported(type) && turing_mma_available(info.cc)) {
+                const std::string fused = mmq_nvrtc_recipe_for(type, J, fallback, prec, true).main;
+                ggml_cuda_nvrtc_require_shared(device, "mmq.cuh", fused, shared);
+                expressions.push_back(fused);
+            }
+        }
+    }
+    if (!expressions.empty()) {
+        ggml_cuda_nvrtc_enqueue(device, "mmq.cuh", expressions);
+    }
+}
+#endif
 
 // Tile width in ne11 (dense) / ne12 (MoE) direction with the fewest tiles that fits into shared memory, 0 if there is none.
 static int ggml_cuda_mmq_get_J_best(

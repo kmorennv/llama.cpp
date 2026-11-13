@@ -5,114 +5,7 @@
 #include "fattn-vec.cuh"
 #include "fattn.cuh"
 
-#if !defined(GGML_USE_MUSA)
-
-// one list per group of ncols1 queries: a column is selected if any query of the group can see it
-template <int ncols1, bool oob>
-__launch_bounds__(256, 1)
-static __global__ void flash_attn_mask_to_sparse_indices(
-        const half * mask_ptr, int32_t * indices_ptr, int32_t * counts_ptr, const int ne30, const int n_queries,
-        const int n_kv_max, const int64_t s31, const int64_t s33) {
-    ggml_cuda_pdl_sync();
-
-    constexpr int warp_size = ggml_cuda_get_physical_warp_size();
-    constexpr int values_per_lane = 8;
-    using lane_mask_t = std::conditional_t<warp_size == 64, uint64_t, uint32_t>;
-    constexpr uint64_t ballot_mask = ~(lane_mask_t)0;
-    const auto popc = [](const lane_mask_t mask) {
-        if constexpr (warp_size == 64) {
-            return __popcll(mask);
-        } else {
-            return __popc(mask);
-        }
-    };
-    const int tid      = threadIdx.x;
-    const int warp     = tid / warp_size;
-    const int lane     = tid % warp_size;
-    const int sequence = blockIdx.y;
-    const int group    = blockIdx.x;
-
-    const int q0 = group*ncols1;
-    const int q1 = min(q0 + ncols1, n_queries);
-
-    const half * mask = mask_ptr + sequence*s33 + q0*s31;
-    int32_t * indices = indices_ptr + (int64_t(sequence)*gridDim.x + group)*n_kv_max;
-
-    __shared__ int warp_offsets[256/warp_size];
-    __shared__ int row_count;
-    __shared__ int chunk_count;
-
-    if (tid == 0) {
-        row_count = 0;
-    }
-    __syncthreads();
-
-    for (int i0 = 0; i0 < ne30; i0 += blockDim.x*values_per_lane) {
-        lane_mask_t selected_warp[values_per_lane];
-        int warp_count = 0;
-#pragma unroll
-        for (int item = 0; item < values_per_lane; ++item) {
-            const int i = i0 + (warp*values_per_lane + item)*warp_size + lane;
-            bool selected = false;
-            if (i < ne30) {
-#pragma unroll
-                for (int q = 0; q < ncols1; ++q) {
-                    selected |= (!oob || q < q1 - q0) && isfinite(__half2float(mask[q*s31 + i]));
-                }
-            }
-            selected_warp[item] = (lane_mask_t)__ballot_sync(ballot_mask, (int) selected);
-            warp_count += popc(selected_warp[item]);
-        }
-
-        if (lane == 0) {
-            warp_offsets[warp] = warp_count;
-        }
-        __syncthreads();
-
-        if (tid == 0) {
-            int offset = 0;
-#pragma unroll
-            for (int iw = 0; iw < 256/warp_size; ++iw) {
-                const int count = warp_offsets[iw];
-                warp_offsets[iw] = offset;
-                offset += count;
-            }
-            chunk_count = offset;
-        }
-        __syncthreads();
-
-        const lane_mask_t lane_mask = lane == 0 ? 0 : ((lane_mask_t)1 << lane) - 1;
-        int warp_item_offset = 0;
-#pragma unroll
-        for (int item = 0; item < values_per_lane; ++item) {
-            const int i = i0 + (warp*values_per_lane + item)*warp_size + lane;
-            const int dst = row_count + warp_offsets[warp] + warp_item_offset + popc(selected_warp[item] & lane_mask);
-            if ((selected_warp[item] & ((lane_mask_t)1 << lane)) && dst < n_kv_max) {
-                indices[dst] = i;
-            }
-            warp_item_offset += popc(selected_warp[item]);
-        }
-        __syncthreads();
-
-        if (tid == 0) {
-            row_count += chunk_count;
-        }
-        __syncthreads();
-    }
-
-    const int count = min(row_count, n_kv_max);
-    for (int i = count + tid; i < n_kv_max; i += blockDim.x) {
-        indices[i] = -1;
-    }
-    if (tid == 0) {
-        counts_ptr[int64_t(sequence)*gridDim.x + group] = count;
-    }
-    __syncthreads();
-
-    // the dependent grid reads indices, signal once the row is complete
-    ggml_cuda_pdl_lc();
-}
-#endif // !defined(GGML_USE_MUSA)
+#include "fattn-mask.cuh"
 
 void ggml_cuda_flash_attn_ext_compact_mask(
         const ggml_tensor * mask, int32_t * indices, int32_t * counts, int32_t n_queries, int32_t ncols1, int32_t n_kv_max, cudaStream_t stream) {
@@ -127,11 +20,17 @@ void ggml_cuda_flash_attn_ext_compact_mask(
     const ggml_cuda_kernel_launch_params launch_params(blocks_num, block_dim, 0, stream);
     // the last group of queries is partial only if ncols1 does not divide n_queries
     GGML_ASSERT(ncols1 == 1 || ncols1 == 8);
+#ifdef GGML_CUDA_NVRTC
+    const std::string kernel = fattn_nvrtc_expression("flash_attn_mask_to_sparse_indices", ncols1, n_queries % ncols1 != 0);
+    ggml_cuda_nvrtc_launch("fattn-mask.cuh", kernel, launch_params, 0, true,
+        (const half *) mask->data, indices, counts, int(mask->ne[0]), n_queries, n_kv_max, s31, s33);
+#else
     const auto kernel = ncols1 == 1       ? flash_attn_mask_to_sparse_indices<1, false> :
                         n_queries % 8 != 0 ? flash_attn_mask_to_sparse_indices<8, true>  :
                                              flash_attn_mask_to_sparse_indices<8, false>;
     ggml_cuda_kernel_launch(kernel, launch_params,
         (const half *) mask->data, indices, counts, int(mask->ne[0]), n_queries, n_kv_max, s31, s33);
+#endif
     CUDA_CHECK(cudaGetLastError());
 #endif // !defined(GGML_USE_MUSA)
 }
@@ -836,3 +735,118 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
 bool ggml_cuda_flash_attn_ext_supported(int device, const ggml_tensor * dst) {
     return ggml_cuda_get_best_fattn_kernel(device, dst) != BEST_FATTN_KERNEL_NONE;
 }
+
+#ifdef GGML_CUDA_NVRTC
+static void ggml_cuda_nvrtc_fattn_mma_prepare(
+        int device, int DKQ, int DV, bool use_softcap, bool use_sparse, bool has_mask,
+        std::vector<std::string> * common) {
+    const auto & info = ggml_cuda_info().devices[device];
+    const int cc = info.cc;
+    if (!(turing_mma_available(cc) || volta_mma_available(cc))) {
+        return;
+    }
+    std::vector<std::string> main;
+    for (int cols2 : { 1, 2, 4, 8, 16, 32 }) {
+        const bool allowed = DKQ <= 256 && DKQ != 192 ? cols2 <= 8 :
+            DKQ == 192 ? (cols2 == 8 || cols2 == 16) :
+            DKQ == 320 ? cols2 == 32 :
+            DKQ == 512 ? (cols2 == 2 || cols2 == 4 || cols2 == 8) :
+            DKQ == 576 ? (cols2 == 4 || cols2 == 16 || cols2 == 32) : false;
+        if (!allowed) {
+            continue;
+        }
+        for (int cols : { 8, 16, 32, 64 }) {
+            if (cols < cols2 || (DKQ == 320 && cols < 32) || (DKQ == 576 && cols2 == 4 && cols < 16) ||
+                ggml_cuda_fattn_mma_get_config(DKQ, DV, cols, cc).nbatch_fa == 0) {
+                continue;
+            }
+            const int cols1 = cols/cols2;
+            main.push_back(fattn_nvrtc_expression("flash_attn_ext_f16", DKQ, DV, cols1, cols2, use_softcap, DKQ == 576, false));
+            const int shared = ggml_cuda_fattn_mma_get_nbytes_shared(DKQ, DV, cols1, cols2, cc, info.warp_size);
+            ggml_cuda_nvrtc_require_shared(device, "fattn-mma-f16.cuh", main.back(), shared);
+            if (!use_softcap && use_sparse && ggml_cuda_flash_attn_ext_mma_f16_may_use_sparse(DKQ, DV, cols1, cols2)) {
+                main.push_back(fattn_nvrtc_expression("flash_attn_ext_f16", DKQ, DV, cols1, cols2, false, DKQ == 576, true));
+                ggml_cuda_nvrtc_require_shared(device, "fattn-mma-f16.cuh", main.back(), shared);
+            }
+            if (common) {
+                common->push_back(fattn_nvrtc_expression("flash_attn_stream_k_fixup_uniform", DV, cols1, cols2));
+                common->push_back(fattn_nvrtc_expression("flash_attn_stream_k_fixup_general", DV, cols1, cols2));
+                if (has_mask) {
+                    common->push_back(fattn_nvrtc_expression("flash_attn_mask_to_KV_max", cols1));
+                }
+            }
+        }
+    }
+    ggml_cuda_nvrtc_enqueue(device, "fattn-mma-f16.cuh", main);
+}
+
+void ggml_cuda_nvrtc_fattn_prepare_mma(int device, int DKQ, int DV, bool use_softcap) {
+    ggml_cuda_nvrtc_fattn_mma_prepare(device, DKQ, DV, use_softcap, false, false, nullptr);
+}
+
+void ggml_cuda_nvrtc_fattn_prepare(int device, const ggml_tensor * dst) {
+    if (!ggml_cuda_flash_attn_ext_supported(device, dst)) {
+        return;
+    }
+    const ggml_tensor * Q = dst->src[0];
+    const ggml_tensor * K = dst->src[1];
+    const ggml_tensor * V = dst->src[2];
+    const int DKQ = Q->ne[0];
+    const int DV = V->ne[0];
+    const int cc = ggml_cuda_info().devices[device].cc;
+    float softcap;
+    memcpy(&softcap, (const float *) dst->op_params + 2, sizeof(softcap));
+    const bool use_softcap = softcap != 0.0f;
+    std::vector<std::string> common;
+
+    if (DKQ == DV && (DKQ == 64 || DKQ == 128 || DKQ == 256)) {
+        const bool fallback = ggml_cuda_get_fattn_vec_case(DKQ, K->type, V->type) == nullptr;
+        const ggml_type type_K = fallback || K->type == GGML_TYPE_F32 ? GGML_TYPE_F16 : K->type;
+        const ggml_type type_V = fallback || V->type == GGML_TYPE_F32 ? GGML_TYPE_F16 : V->type;
+        std::vector<std::string> vec;
+        for (int cols : { 1, 2 }) {
+            vec.push_back(fattn_nvrtc_expression("flash_attn_ext_vec", DKQ, cols, type_K, type_V, use_softcap));
+            if (dst->src[3]) {
+                common.push_back(fattn_nvrtc_expression("flash_attn_mask_to_KV_max", cols));
+            }
+        }
+        ggml_cuda_nvrtc_enqueue(device, "fattn-vec.cuh", vec);
+        common.push_back(fattn_nvrtc_expression("flash_attn_combine_results", DV));
+    }
+
+    ggml_cuda_nvrtc_fattn_mma_prepare(device, DKQ, DV, use_softcap, ggml_get_op_params_i32(dst, 4) > 0, dst->src[3] != nullptr, &common);
+    if (ggml_cuda_fattn_tile_may_use(turing_mma_available(cc))) {
+        std::vector<std::string> main;
+        for (int cols2 : { 1, 2, 4, 8, 16, 32 }) {
+            const bool allowed = DKQ <= 256 && DKQ != 192 ? cols2 <= 8 :
+                DKQ == 192 ? (cols2 == 8 || cols2 == 16) :
+                DKQ == 320 ? cols2 == 16 :
+                DKQ == 512 ? (cols2 == 2 || cols2 == 4 || cols2 == 8) :
+                DKQ == 576 ? (cols2 == 4 || cols2 == 16) : false;
+            if (!allowed) {
+                continue;
+            }
+            for (int cols : { 2, 4, 8, 16, 32 }) {
+                if (cols < cols2 || ggml_cuda_fattn_tile_get_config(DKQ, DV, cols, cc) == 0) {
+                    continue;
+                }
+                const int cols1 = cols/cols2;
+                main.push_back(fattn_nvrtc_expression("flash_attn_tile", DKQ, DV, cols1, cols2, use_softcap));
+                common.push_back(fattn_nvrtc_expression("flash_attn_combine_results", DV));
+                if (dst->src[3]) {
+                    common.push_back(fattn_nvrtc_expression("flash_attn_mask_to_KV_max", cols1));
+                }
+            }
+        }
+        ggml_cuda_nvrtc_enqueue(device, "fattn-tile.cuh", main);
+    }
+    ggml_cuda_nvrtc_enqueue(device, "fattn-common.cuh", common);
+    if (ggml_get_op_params_i32(dst, 4) > 0) {
+        ggml_cuda_nvrtc_enqueue(device, "fattn-mask.cuh", {
+            fattn_nvrtc_expression("flash_attn_mask_to_sparse_indices", 1, false),
+            fattn_nvrtc_expression("flash_attn_mask_to_sparse_indices", 8, false),
+            fattn_nvrtc_expression("flash_attn_mask_to_sparse_indices", 8, true),
+        });
+    }
+}
+#endif

@@ -3,6 +3,13 @@
 #include "mma.cuh"
 #include "fattn-common.cuh"
 
+#ifdef __CUDACC_RTC__
+#include <math_constants.h>
+#ifndef INFINITY
+#define INFINITY CUDART_INF_F
+#endif
+#endif
+
 using namespace ggml_cuda_mma;
 
 // Config options for the MMA kernel.
@@ -264,6 +271,7 @@ static constexpr __host__ __device__ fattn_mma_config ggml_cuda_fattn_mma_get_co
     return fattn_mma_config(32, 1, 0, 0, 0, 0, 0, false);
 }
 
+#ifndef __CUDACC_RTC__
 static __host__ fattn_mma_config ggml_cuda_fattn_mma_get_config(const int DKQ, const int DV, const int ncols, const int cc) {
     if (ampere_mma_available(cc)) {
         return ggml_cuda_fattn_mma_get_config_ampere(DKQ, DV, ncols);
@@ -280,6 +288,7 @@ static __host__ fattn_mma_config ggml_cuda_fattn_mma_get_config(const int DKQ, c
     GGML_ASSERT(volta_mma_available(cc));
     return ggml_cuda_fattn_mma_get_config_volta(DKQ, DV, ncols);
 }
+#endif
 
 static constexpr __device__ fattn_mma_config ggml_cuda_fattn_mma_get_config(const int DKQ, const int DV, const int ncols) {
 #if defined(AMPERE_MMA_AVAILABLE)
@@ -298,65 +307,81 @@ static constexpr __device__ fattn_mma_config ggml_cuda_fattn_mma_get_config(cons
 #endif // defined(AMPERE_MMA_AVAILABLE)
 }
 
+#ifndef __CUDACC_RTC__
 static __host__ int ggml_cuda_fattn_mma_get_nthreads(const int DKQ, const int DV, const int ncols, const int cc) {
     return ggml_cuda_fattn_mma_get_config(DKQ, DV, ncols, cc).nthreads;
 }
+#endif
 
 static constexpr __device__ int ggml_cuda_fattn_mma_get_nthreads(const int DKQ, const int DV, const int ncols) {
     return ggml_cuda_fattn_mma_get_config(DKQ, DV, ncols).nthreads;
 }
 
+#ifndef __CUDACC_RTC__
 static __host__ int ggml_cuda_fattn_mma_get_occupancy(const int DKQ, const int DV, const int ncols, const int cc) {
     return ggml_cuda_fattn_mma_get_config(DKQ, DV, ncols, cc).occupancy;
 }
+#endif
 
 static constexpr __device__ int ggml_cuda_fattn_mma_get_occupancy(const int DKQ, const int DV, const int ncols) {
     return ggml_cuda_fattn_mma_get_config(DKQ, DV, ncols).occupancy;
 }
 
+#ifndef __CUDACC_RTC__
 static __host__ int ggml_cuda_fattn_mma_get_nbatch_fa(const int DKQ, const int DV, const int ncols, const int cc) {
     return ggml_cuda_fattn_mma_get_config(DKQ, DV, ncols, cc).nbatch_fa;
 }
+#endif
 
 static constexpr __device__ int ggml_cuda_fattn_mma_get_nbatch_fa(const int DKQ, const int DV, const int ncols) {
     return ggml_cuda_fattn_mma_get_config(DKQ, DV, ncols).nbatch_fa;
 }
 
+#ifndef __CUDACC_RTC__
 static __host__ int ggml_cuda_fattn_mma_get_nbatch_K2(const int DKQ, const int DV, const int ncols, const int cc) {
     return ggml_cuda_fattn_mma_get_config(DKQ, DV, ncols, cc).nbatch_K2;
 }
+#endif
 
 static constexpr __device__ int ggml_cuda_fattn_mma_get_nbatch_K2(const int DKQ, const int DV, const int ncols) {
     return ggml_cuda_fattn_mma_get_config(DKQ, DV, ncols).nbatch_K2;
 }
 
+#ifndef __CUDACC_RTC__
 static __host__ int ggml_cuda_fattn_mma_get_nbatch_V2(const int DKQ, const int DV, const int ncols, const int cc) {
     return ggml_cuda_fattn_mma_get_config(DKQ, DV, ncols, cc).nbatch_V2;
 }
+#endif
 
 static constexpr __device__ int ggml_cuda_fattn_mma_get_nbatch_V2(const int DKQ, const int DV, const int ncols) {
     return ggml_cuda_fattn_mma_get_config(DKQ, DV, ncols).nbatch_V2;
 }
 
+#ifndef __CUDACC_RTC__
 static __host__ int ggml_cuda_fattn_mma_get_nbatch_combine(const int DKQ, const int DV, const int ncols, const int cc) {
     return ggml_cuda_fattn_mma_get_config(DKQ, DV, ncols, cc).nbatch_combine;
 }
+#endif
 
 static constexpr __device__ int ggml_cuda_fattn_mma_get_nbatch_combine(const int DKQ, const int DV, const int ncols) {
     return ggml_cuda_fattn_mma_get_config(DKQ, DV, ncols).nbatch_combine;
 }
 
+#ifndef __CUDACC_RTC__
 static __host__ int ggml_cuda_fattn_mma_get_nstages_target(const int DKQ, const int DV, const int ncols, const int cc) {
     return ggml_cuda_fattn_mma_get_config(DKQ, DV, ncols, cc).nstages_target;
 }
+#endif
 
 static constexpr __device__ int ggml_cuda_fattn_mma_get_nstages_target(const int DKQ, const int DV, const int ncols) {
     return ggml_cuda_fattn_mma_get_config(DKQ, DV, ncols).nstages_target;
 }
 
+#ifndef __CUDACC_RTC__
 static __host__ bool ggml_cuda_fattn_mma_get_Q_in_reg(const int DKQ, const int DV, const int ncols, const int cc) {
     return ggml_cuda_fattn_mma_get_config(DKQ, DV, ncols, cc).Q_in_reg;
 }
+#endif
 
 static constexpr __device__ bool ggml_cuda_fattn_mma_get_Q_in_reg(const int DKQ, const int DV, const int ncols) {
     return ggml_cuda_fattn_mma_get_config(DKQ, DV, ncols).Q_in_reg;
@@ -370,6 +395,7 @@ static constexpr __device__ int get_cols_per_thread() {
 #endif // defined(AMD_WMMA_AVAILABLE) || defined(AMD_MFMA_AVAILABLE)
 }
 
+#ifndef __CUDACC_RTC__
 static __host__ int get_cols_per_warp(const int cc) {
     if (turing_mma_available(cc) || amd_wmma_available(cc) || amd_mfma_available(cc)) {
         return 16;
@@ -378,11 +404,15 @@ static __host__ int get_cols_per_warp(const int cc) {
         return 32;
     }
 }
+#endif
 
+
+#ifndef __CUDACC_RTC__
 static __host__ bool ggml_cuda_fattn_mma_get_swizzled(const int DKQ, const int DV, const int ncols, const int cc) {
     return turing_mma_available(cc) &&
         ggml_cuda_fattn_mma_get_nbatch_K2(DKQ, DV, ncols, cc) % 32 == 0 && ggml_cuda_fattn_mma_get_nbatch_V2(DKQ, DV, ncols, cc) % 32 == 0;
 }
+#endif
 
 static constexpr __device__ bool ggml_cuda_fattn_mma_get_swizzled(const int DKQ, const int DV, const int ncols) {
 #ifdef TURING_MMA_AVAILABLE
@@ -395,9 +425,11 @@ static constexpr __device__ bool ggml_cuda_fattn_mma_get_swizzled(const int DKQ,
 
 // ------------------------------------------------------------------------------------------------------------------
 
+#ifndef __CUDACC_RTC__
 static __host__ int ggml_cuda_fattn_mma_get_nstages(const int DKQ, const int DV, const int ncols1, const int ncols2, const int cc) {
     return cp_async_available(cc) && ncols2 >= 2 ? ggml_cuda_fattn_mma_get_nstages_target(DKQ, DV, ncols1*ncols2, cc) : 0;
 }
+#endif
 
 static constexpr __device__ int ggml_cuda_fattn_mma_get_nstages(
         const int DKQ, const int DV, const int ncols1, const int ncols2, const bool use_sparse) {
@@ -430,7 +462,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_load_tile(
 
         const unsigned int tile_KV_32 = ggml_cuda_cvta_generic_to_shared(tile_KV);
 
-        auto load = [&] __device__ (auto n) {
+        auto load = [&] GGML_CUDA_FATTN_DEVICE_LAMBDA (auto n) {
             const int stride_k = warp_size >> n;
             const int k0_start = stride_k == warp_size ? 0 : chunks_per_row - chunks_per_row % (2*stride_k);
             const int k0_stop  =                             chunks_per_row - chunks_per_row % (1*stride_k);
@@ -477,7 +509,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_load_tile(
         ggml_cuda_unroll<6>{}(load);
     } else {
         const half2 zero[4] = {{0.0f, 0.0f}, {0.0f, 0.0f}, {0.0f, 0.0f}, {0.0f, 0.0f}};
-        auto load = [&] __device__ (const int n) {
+        auto load = [&] GGML_CUDA_FATTN_DEVICE_LAMBDA (const int n) {
             const int stride_k = 32 >> n;
             const int k0_start = stride_k == 32 ? 0 : chunks_per_row - chunks_per_row % (2*stride_k);
             const int k0_stop  =                      chunks_per_row - chunks_per_row % (1*stride_k);
@@ -2118,16 +2150,11 @@ static __global__ void flash_attn_ext_f16(
 #endif // defined(FLASH_ATTN_AVAILABLE) && (defined(VOLTA_MMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE) || defined(AMD_MFMA_AVAILABLE))
 }
 
+#ifndef __CUDACC_RTC__
 bool ggml_cuda_flash_attn_ext_mma_f16_shall_use_sparse(const int cc, const ggml_tensor * dst, const int ncols1, const int ncols2);
 
-template <int DKQ, int DV, int ncols1, int ncols2>
-void ggml_cuda_flash_attn_ext_mma_f16_case(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
-    const ggml_tensor * KQV = dst;
-    const int id = ggml_cuda_get_device();
-    const int cc = ggml_cuda_info().devices[id].cc;
-
-    constexpr int ncols = ncols1 * ncols2;
-
+static size_t ggml_cuda_fattn_mma_get_nbytes_shared(int DKQ, int DV, int ncols1, int ncols2, int cc, int warp_size) {
+    const int ncols = ncols1*ncols2;
     const int  nthreads       = ggml_cuda_fattn_mma_get_nthreads      (DKQ, DV, ncols, cc);
     const int  nbatch_fa      = ggml_cuda_fattn_mma_get_nbatch_fa     (DKQ, DV, ncols, cc);
     const int  nbatch_K2      = ggml_cuda_fattn_mma_get_nbatch_K2     (DKQ, DV, ncols, cc);
@@ -2137,11 +2164,10 @@ void ggml_cuda_flash_attn_ext_mma_f16_case(ggml_backend_cuda_context & ctx, ggml
     const int  nstages        = ggml_cuda_fattn_mma_get_nstages       (DKQ, DV, ncols1, ncols2, cc);
 
     const int cols_per_warp = std::min(ncols, get_cols_per_warp(cc));
-    const int warp_size_host = ggml_cuda_info().devices[ctx.device].warp_size;
-    const int nwarps         = nthreads / warp_size_host;
+    const int nwarps = nthreads/warp_size;
 
-    constexpr bool V_is_K_view = DKQ == 576; // Guaranteed by the kernel selection logic in fattn.cu
-    constexpr int  DKQp        = GGML_PAD(DKQ, 16);
+    const bool V_is_K_view = DKQ == 576; // Guaranteed by the kernel selection logic in fattn.cu
+    const int  DKQp        = GGML_PAD(DKQ, 16);
 
     // KV tile strides must match flash_attn_ext_f16_iter / _process_tile.
     const bool swz = ggml_cuda_fattn_mma_get_swizzled(DKQ, DV, ncols, cc);
@@ -2155,13 +2181,37 @@ void ggml_cuda_flash_attn_ext_mma_f16_case(ggml_backend_cuda_context & ctx, ggml
 
     const size_t nbytes_shared_KV = nstages <= 1 ? nbytes_shared_KV_1stage : nbytes_shared_KV_2stage;
 
-    const size_t nbytes_shared_total = std::max(nbytes_shared_combine, Q_in_reg ?
+    return std::max(nbytes_shared_combine, Q_in_reg ?
         std::max(nbytes_shared_Q,  nbytes_shared_KV + nbytes_shared_mask) :
                  nbytes_shared_Q + nbytes_shared_KV + nbytes_shared_mask);
+}
+
+template <int DKQ, int DV, int ncols1, int ncols2>
+void ggml_cuda_flash_attn_ext_mma_f16_case(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    const ggml_tensor * KQV = dst;
+    const int id = ggml_cuda_get_device();
+    const int cc = ggml_cuda_info().devices[id].cc;
+
+    constexpr int ncols = ncols1 * ncols2;
+
+    const int nthreads = ggml_cuda_fattn_mma_get_nthreads(DKQ, DV, ncols, cc);
+    const int nbatch_fa = ggml_cuda_fattn_mma_get_nbatch_fa(DKQ, DV, ncols, cc);
+    const int nstages = ggml_cuda_fattn_mma_get_nstages(DKQ, DV, ncols1, ncols2, cc);
+    const int warp_size_host = ggml_cuda_info().devices[ctx.device].warp_size;
+    const int nwarps = nthreads/warp_size_host;
+    constexpr bool V_is_K_view = DKQ == 576;
+    const size_t nbytes_shared_total = ggml_cuda_fattn_mma_get_nbytes_shared(DKQ, DV, ncols1, ncols2, cc, warp_size_host);
 
     float logit_softcap;
     memcpy(&logit_softcap, (const float *) KQV->op_params + 2, sizeof(float));
 
+#ifdef GGML_CUDA_NVRTC
+    const bool use_sparse = logit_softcap == 0.0f &&
+        ggml_cuda_flash_attn_ext_mma_f16_may_use_sparse(DKQ, DV, ncols1, ncols2) &&
+        ggml_cuda_flash_attn_ext_mma_f16_shall_use_sparse(cc, dst, ncols1, ncols2);
+    fattn_kernel_t fattn_kernel = GGML_CUDA_FATTN_KERNEL("fattn-mma-f16.cuh", flash_attn_ext_f16,
+        DKQ, DV, ncols1, ncols2, logit_softcap != 0.0f, V_is_K_view, use_sparse);
+#else
 #if defined(GGML_USE_HIP)
     using fattn_kernel_ptr_t = const void*;
 #else
@@ -2217,6 +2267,7 @@ void ggml_cuda_flash_attn_ext_mma_f16_case(ggml_backend_cuda_context & ctx, ggml
         }
     }
 
+#endif // GGML_CUDA_NVRTC
     const bool async_kv_preload = nstages == 2 && !use_sparse;
     launch_fattn<DV, ncols1, ncols2>
         (ctx, dst, fattn_kernel, nwarps, nbytes_shared_total, nbatch_fa, true, true, true, use_sparse, warp_size_host, async_kv_preload);
@@ -2227,6 +2278,7 @@ void ggml_cuda_flash_attn_ext_mma_f16_case(ggml_backend_cuda_context & ctx, ggml
     template void ggml_cuda_flash_attn_ext_mma_f16_case                           \
     <DKQ, DV, ncols1, ncols2>(ggml_backend_cuda_context & ctx, ggml_tensor * dst) \
 
+#ifndef GGML_CUDA_NVRTC
 #define DECL_FATTN_MMA_F16_CASE_ALL_NCOLS2(DKQ, DV, ncols)   \
     extern DECL_FATTN_MMA_F16_CASE(DKQ, DV, (ncols)/ 1,  1); \
     extern DECL_FATTN_MMA_F16_CASE(DKQ, DV, (ncols)/ 2,  2); \
@@ -2298,3 +2350,6 @@ extern DECL_FATTN_MMA_F16_CASE(576, 512,  8,  4);
 extern DECL_FATTN_MMA_F16_CASE(576, 512, 16,  4);
 extern DECL_FATTN_MMA_F16_CASE(576, 512,  1, 32);
 extern DECL_FATTN_MMA_F16_CASE(576, 512,  2, 32);
+
+#endif // GGML_CUDA_NVRTC
+#endif // __CUDACC_RTC__

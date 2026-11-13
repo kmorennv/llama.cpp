@@ -1,5 +1,8 @@
 #include "mmvq.cuh"
+#ifndef __CUDACC_RTC__
 #include "quantize.cuh"
+#include "nvrtc-kernels.cuh"
+#endif
 #include "unary.cuh"
 #include "vecdotq.cuh"
 
@@ -37,7 +40,7 @@ static __device__ __forceinline__ void mmvq_prefetch_l2(const void * p) {
 
 typedef float (*vec_dot_q_cuda_t)(const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs);
 
-static constexpr __device__ vec_dot_q_cuda_t get_vec_dot_q_cuda(ggml_type type) {
+[[maybe_unused]] static constexpr __device__ vec_dot_q_cuda_t get_vec_dot_q_cuda(ggml_type type) {
     switch (type) {
         case GGML_TYPE_Q1_0:    return vec_dot_q1_0_q8_1;
         case GGML_TYPE_Q2_0:    return vec_dot_q2_0_q8_1;
@@ -121,6 +124,7 @@ static constexpr __device__ mmvq_parameter_table_id get_device_table_id() {
 #endif
 }
 
+#ifndef __CUDACC_RTC__
 static __host__ mmvq_parameter_table_id get_device_table_id(int cc) {
     if (GGML_CUDA_CC_IS_RDNA4(cc)) {
         return MMVQ_PARAMETERS_RDNA4;
@@ -142,6 +146,7 @@ static __host__ mmvq_parameter_table_id get_device_table_id(int cc) {
     }
     return MMVQ_PARAMETERS_GENERIC;
 }
+#endif
 
 // Per-architecture maximum batch size for which MMVQ should be used for MUL_MAT_ID.
 // Returns a value <= MMVQ_MAX_BATCH_SIZE. Default is MMVQ_MAX_BATCH_SIZE.
@@ -282,6 +287,7 @@ static constexpr __host__ __device__ int get_mmvq_mmid_max_batch_rdna4(ggml_type
 }
 
 // Host function: returns the max batch size for the current arch+type at runtime.
+#ifndef __CUDACC_RTC__
 int get_mmvq_mmid_max_batch(ggml_type type, int cc) {
     // NVIDIA: P100, Volta, Ada Lovelace, and Blackwell always use MMVQ for MUL_MAT_ID.
     if (GGML_CUDA_CC_IS_NVIDIA(cc)) {
@@ -427,6 +433,7 @@ bool ggml_cuda_should_use_mmvq(enum ggml_type type, int cc, int64_t ne11) {
     }
     return ne11 <= MMVQ_MAX_BATCH_SIZE;
 }
+#endif
 
 // Device constexpr: returns the max batch size for the current arch+type at compile time.
 template <ggml_type type>
@@ -1032,6 +1039,18 @@ static __global__ void mul_mat_vec_q_moe(
     }
 }
 
+#ifndef __CUDACC_RTC__
+#ifdef GGML_CUDA_NVRTC
+static std::string ggml_cuda_mmvq_kernel_expression(ggml_type type, int ncols, bool fusion, bool small_k, bool halve_iters) {
+    return "mul_mat_vec_q<(ggml_type)" + std::to_string(type) + "," + std::to_string(ncols) + "," +
+        (fusion ? "true" : "false") + "," + (small_k ? "true" : "false") + "," + (halve_iters ? "true" : "false") + ">";
+}
+
+static std::string ggml_cuda_mmvq_moe_kernel_expression(ggml_type type, bool fusion) {
+    return "mul_mat_vec_q_moe<(ggml_type)" + std::to_string(type) + ",2," + (fusion ? "true" : "false") + ">";
+}
+#endif
+
 template<ggml_type type>
 static std::pair<dim3, dim3> calc_launch_params(
         const int ncols_dst, const int nrows_x, const int nchannels_dst, const int nsamples_or_ntokens,
@@ -1044,103 +1063,17 @@ static std::pair<dim3, dim3> calc_launch_params(
     return {block_nums, block_dims};
 }
 
-template<ggml_type type, int c_ncols_dst, bool small_k = false, bool halve_iters = false>
-static void mul_mat_vec_q_switch_fusion(
-        const void * vx, const void * vy, const int32_t * ids, const ggml_cuda_mm_fusion_args_device fusion, float * dst,
-        const uint32_t ncols_x, const uint3 nchannels_y, const uint32_t stride_row_x, const uint32_t stride_col_y,
-        const uint32_t stride_col_dst, const uint3 channel_ratio, const uint32_t stride_channel_x,
-        const uint32_t stride_channel_y, const uint32_t stride_channel_dst, const uint3 sample_ratio,
-        const uint32_t stride_sample_x, const uint32_t stride_sample_y, const uint32_t stride_sample_dst,
-        const dim3 & block_nums, const dim3 & block_dims, const int nbytes_shared,
-        const uint32_t ids_stride, cudaStream_t stream) {
-
-    const bool has_fusion = fusion.gate != nullptr || fusion.x_bias != nullptr || fusion.gate_bias != nullptr ||
-                            fusion.x_scale != nullptr || fusion.gate_scale != nullptr;
-    if constexpr (c_ncols_dst == 1) {
-        if (has_fusion) {
-            const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(block_nums, block_dims, nbytes_shared, stream);
-            ggml_cuda_kernel_launch(mul_mat_vec_q<type, c_ncols_dst, true, small_k, halve_iters>, launch_params,
-                 vx, vy, ids, fusion, dst, ncols_x, nchannels_y, stride_row_x, stride_col_y, stride_col_dst,
-                 channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
-                 sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride);
-            return;
-        }
-    }
-
-    GGML_ASSERT(!has_fusion && "fusion only supported for ncols_dst=1");
-
-    const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(block_nums, block_dims, nbytes_shared, stream);
-    ggml_cuda_kernel_launch(mul_mat_vec_q<type, c_ncols_dst, false, small_k, halve_iters>, launch_params,
-        vx, vy, ids, fusion, dst, ncols_x, nchannels_y, stride_row_x, stride_col_y, stride_col_dst,
-        channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
-        sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride);
-}
-
 template <ggml_type type>
-static void mul_mat_vec_q_moe_launch(
-        const void * vx, const void * vy, const int32_t * ids, const ggml_cuda_mm_fusion_args_device fusion, float * dst,
-        const uint32_t ncols_x, const uint3 nchannels_y, const uint32_t nrows_x,
-        const uint32_t stride_row_x, const uint32_t stride_col_y, const uint32_t stride_col_dst,
-        const uint32_t stride_channel_x, const uint32_t stride_channel_y, const uint32_t stride_channel_dst,
-        const uint32_t ncols_dst, const uint32_t ids_stride,
-        const int warp_size, const int nchannels_dst, cudaStream_t stream) {
-
-    constexpr int rows_per_block = 2; // 2 gives best perf based on tuning
-    const int64_t nblocks_rows = (nrows_x + rows_per_block - 1) / rows_per_block;
-    const dim3 block_nums(nblocks_rows, nchannels_dst + (fusion.shared_up != nullptr));
-    const dim3 block_dims(warp_size, ncols_dst);
-    const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(block_nums, block_dims, 0, stream);
-
-    const bool has_fusion = fusion.gate != nullptr || fusion.x_bias != nullptr || fusion.gate_bias != nullptr ||
-                            fusion.x_scale != nullptr || fusion.gate_scale != nullptr;
-
-    if (has_fusion) {
-        ggml_cuda_kernel_launch(mul_mat_vec_q_moe<type, rows_per_block, true>, launch_params,
-            vx, vy, ids, fusion, dst, ncols_x, nchannels_y, nrows_x,
-            stride_row_x, stride_col_y, stride_col_dst,
-            stride_channel_x, stride_channel_y, stride_channel_dst,
-            ncols_dst, ids_stride);
-    } else {
-        ggml_cuda_kernel_launch(mul_mat_vec_q_moe<type, rows_per_block, false>, launch_params,
-            vx, vy, ids, fusion, dst, ncols_x, nchannels_y, nrows_x,
-            stride_row_x, stride_col_y, stride_col_dst,
-            stride_channel_x, stride_channel_y, stride_channel_dst,
-            ncols_dst, ids_stride);
-    }
-}
-
-template <ggml_type type>
-static void mul_mat_vec_q_switch_ncols_dst(
-        const void * vx, const void * vy, const int32_t * ids, const ggml_cuda_mm_fusion_args_device fusion, float * dst,
-        const int ncols_x, const int nrows_x, const int ncols_dst,
-        const int stride_row_x, const int stride_col_y, const int stride_col_dst,
-        const int nchannels_x, const int nchannels_y, const int nchannels_dst,
-        const int stride_channel_x, const int stride_channel_y, const int stride_channel_dst,
-        const int nsamples_x, const int nsamples_dst, const int stride_sample_x, const int stride_sample_y, const int stride_sample_dst,
-        const int ids_stride, cudaStream_t stream) {
-
-    GGML_ASSERT(ncols_x % ggml_blck_size(type) == 0);
-    GGML_ASSERT(ncols_dst <= MMVQ_MAX_BATCH_SIZE);
-
-    const uint3 nchannels_y_fd   = ids ? init_fastdiv_values(nchannels_y) : make_uint3(0, 0, 0);
-    const uint3 channel_ratio_fd = ids ? make_uint3(0, 0, 0)              : init_fastdiv_values(nchannels_dst / nchannels_x);
-    const uint3 sample_ratio_fd  = init_fastdiv_values(nsamples_dst  / nsamples_x);
-
-    const int device = ggml_cuda_get_device();
-    const int                     cc        = ggml_cuda_info().devices[device].cc;
-    const int warp_size = ggml_cuda_info().devices[device].warp_size;
-    const mmvq_parameter_table_id table_id  = get_device_table_id(cc);
-
-    const bool has_ids = ids != nullptr;
-
-    // How the K loop divides up at the baseline block width, both decisions below use these.
+static std::pair<bool, bool> mmvq_ncols1_flags(int cc, int warp_size, int ncols_x, bool has_ids) {
+    const mmvq_parameter_table_id table_id = get_device_table_id(cc);
     constexpr int qk                    = ggml_cuda_type_traits<type>::qk;
     constexpr int qi                    = ggml_cuda_type_traits<type>::qi;
     constexpr int vdr                   = get_vdr_mmvq(type);
     const int     blocks_per_row_x      = ncols_x / qk;
     const int     blocks_per_iter_1warp = vdr * warp_size / qi;
 
-    const auto should_use_small_k = [&](int c_ncols_dst) {
+    const auto should_use_small_k = [&] {
+        constexpr int c_ncols_dst = 1;
         // When K is small, increase rows_per_block to match nwarps so each warp has more work to do
         // Trigger when the full thread block covers all K blocks in a single loop iteration and few threads remain idle.
         const int  nwarps = calc_nwarps(type, c_ncols_dst, table_id);
@@ -1164,11 +1097,10 @@ static void mul_mat_vec_q_switch_ncols_dst(
         const bool is_nvidia_pascal_older = GGML_CUDA_CC_IS_NVIDIA(cc) && cc < GGML_CUDA_CC_VOLTA;
 
         if (is_nvidia_turing_plus) {
-            if (ncols_dst == 1 &&
-                    std::find(iq_slow_turing.begin(), iq_slow_turing.end(), type) != iq_slow_turing.end()) {
+            if (std::find(iq_slow_turing.begin(), iq_slow_turing.end(), type) != iq_slow_turing.end()) {
                 use = false;
             }
-        } else if ((ncols_dst == 1 && std::find(iq_slow_other.begin(), iq_slow_other.end(), type) != iq_slow_other.end()) ||
+        } else if (std::find(iq_slow_other.begin(), iq_slow_other.end(), type) != iq_slow_other.end() ||
                 (is_nvidia_pascal_older && std::find(slow_pascal.begin(), slow_pascal.end(), type) != slow_pascal.end()) ||
                 GGML_CUDA_CC_IS_RDNA(cc)) {
             use = false;
@@ -1198,6 +1130,187 @@ static void mul_mat_vec_q_switch_ncols_dst(
 
         return idle * 8 <= iters_wide * 2;
     };
+
+    return { should_use_small_k(), should_halve_iters() };
+}
+
+#ifdef GGML_CUDA_NVRTC
+template <ggml_type type>
+static void mmvq_prepare_type(int device, int ncols_x, bool moe) {
+    const auto & info = ggml_cuda_info().devices[device];
+    const auto flags = mmvq_ncols1_flags<type>(info.cc, info.warp_size, ncols_x, moe);
+    constexpr bool promoted = calc_nwarps(type, 1, MMVQ_PARAMETERS_GB10, false, true) !=
+                              calc_nwarps(type, 1, MMVQ_PARAMETERS_GB10, false, false);
+    const bool small_k = flags.first;
+    const bool halve_iters = !small_k && flags.second && promoted;
+    std::vector<std::string> expressions = {
+        ggml_cuda_mmvq_kernel_expression(type, 1, false, small_k, halve_iters),
+        ggml_cuda_mmvq_kernel_expression(type, 1, true,  small_k, halve_iters),
+    };
+    if (moe) {
+        expressions.push_back(ggml_cuda_mmvq_moe_kernel_expression(type, false));
+        expressions.push_back(ggml_cuda_mmvq_moe_kernel_expression(type, true));
+    } else {
+        for (int ncols = 2; ncols <= MMVQ_MAX_BATCH_SIZE; ++ncols) {
+            if (ggml_cuda_should_use_mmvq(type, info.cc, ncols)) {
+                expressions.push_back(ggml_cuda_mmvq_kernel_expression(type, ncols, false, false, false));
+            }
+        }
+    }
+    ggml_cuda_nvrtc_enqueue(device, "mmvq.cu", expressions);
+}
+
+void ggml_cuda_nvrtc_mmvq_prepare(int device, ggml_type type, int64_t ncols_x, bool moe) {
+    if (ncols_x <= 0 || ncols_x > INT32_MAX || ncols_x % ggml_blck_size(type) != 0) {
+        return;
+    }
+    switch (type) {
+#define PREPARE_TYPE(TYPE) case TYPE: mmvq_prepare_type<TYPE>(device, (int) ncols_x, moe); break
+        PREPARE_TYPE(GGML_TYPE_Q1_0);
+        PREPARE_TYPE(GGML_TYPE_Q2_0);
+        PREPARE_TYPE(GGML_TYPE_Q4_0);
+        PREPARE_TYPE(GGML_TYPE_Q4_1);
+        PREPARE_TYPE(GGML_TYPE_Q5_0);
+        PREPARE_TYPE(GGML_TYPE_Q5_1);
+        PREPARE_TYPE(GGML_TYPE_Q8_0);
+        PREPARE_TYPE(GGML_TYPE_MXFP4);
+        PREPARE_TYPE(GGML_TYPE_NVFP4);
+        PREPARE_TYPE(GGML_TYPE_Q2_K);
+        PREPARE_TYPE(GGML_TYPE_Q3_K);
+        PREPARE_TYPE(GGML_TYPE_Q4_K);
+        PREPARE_TYPE(GGML_TYPE_Q5_K);
+        PREPARE_TYPE(GGML_TYPE_Q6_K);
+        PREPARE_TYPE(GGML_TYPE_IQ2_XXS);
+        PREPARE_TYPE(GGML_TYPE_IQ2_XS);
+        PREPARE_TYPE(GGML_TYPE_IQ2_S);
+        PREPARE_TYPE(GGML_TYPE_IQ3_XXS);
+        PREPARE_TYPE(GGML_TYPE_IQ1_S);
+        PREPARE_TYPE(GGML_TYPE_IQ1_M);
+        PREPARE_TYPE(GGML_TYPE_IQ4_NL);
+        PREPARE_TYPE(GGML_TYPE_IQ4_XS);
+        PREPARE_TYPE(GGML_TYPE_IQ3_S);
+#undef PREPARE_TYPE
+        default:
+            break;
+    }
+}
+#endif
+
+template<ggml_type type, int c_ncols_dst, bool small_k = false, bool halve_iters = false>
+static void mul_mat_vec_q_switch_fusion(
+        const void * vx, const void * vy, const int32_t * ids, const ggml_cuda_mm_fusion_args_device fusion, float * dst,
+        const uint32_t ncols_x, const uint3 nchannels_y, const uint32_t stride_row_x, const uint32_t stride_col_y,
+        const uint32_t stride_col_dst, const uint3 channel_ratio, const uint32_t stride_channel_x,
+        const uint32_t stride_channel_y, const uint32_t stride_channel_dst, const uint3 sample_ratio,
+        const uint32_t stride_sample_x, const uint32_t stride_sample_y, const uint32_t stride_sample_dst,
+        const dim3 & block_nums, const dim3 & block_dims, const int nbytes_shared,
+        const uint32_t ids_stride, cudaStream_t stream) {
+
+    const bool has_fusion = fusion.gate != nullptr || fusion.x_bias != nullptr || fusion.gate_bias != nullptr ||
+                            fusion.x_scale != nullptr || fusion.gate_scale != nullptr;
+#ifdef GGML_CUDA_NVRTC
+    GGML_ASSERT(c_ncols_dst == 1 || !has_fusion);
+    static const std::string expressions[] = {
+        ggml_cuda_mmvq_kernel_expression(type, c_ncols_dst, false, small_k, halve_iters),
+        ggml_cuda_mmvq_kernel_expression(type, c_ncols_dst, true,  small_k, halve_iters),
+    };
+    const ggml_cuda_kernel_launch_params launch_params(block_nums, block_dims, nbytes_shared, stream);
+    ggml_cuda_nvrtc_launch("mmvq.cu", expressions[has_fusion], launch_params, 0, true,
+        vx, vy, ids, fusion, dst, ncols_x, nchannels_y, stride_row_x, stride_col_y, stride_col_dst,
+        channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
+        sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride);
+#else
+    if constexpr (c_ncols_dst == 1) {
+        if (has_fusion) {
+            const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(block_nums, block_dims, nbytes_shared, stream);
+            ggml_cuda_kernel_launch(mul_mat_vec_q<type, c_ncols_dst, true, small_k, halve_iters>, launch_params,
+                 vx, vy, ids, fusion, dst, ncols_x, nchannels_y, stride_row_x, stride_col_y, stride_col_dst,
+                 channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
+                 sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride);
+            return;
+        }
+    }
+
+    GGML_ASSERT(!has_fusion && "fusion only supported for ncols_dst=1");
+
+    const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(block_nums, block_dims, nbytes_shared, stream);
+    ggml_cuda_kernel_launch(mul_mat_vec_q<type, c_ncols_dst, false, small_k, halve_iters>, launch_params,
+        vx, vy, ids, fusion, dst, ncols_x, nchannels_y, stride_row_x, stride_col_y, stride_col_dst,
+        channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
+        sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride);
+#endif
+}
+
+template <ggml_type type>
+static void mul_mat_vec_q_moe_launch(
+        const void * vx, const void * vy, const int32_t * ids, const ggml_cuda_mm_fusion_args_device fusion, float * dst,
+        const uint32_t ncols_x, const uint3 nchannels_y, const uint32_t nrows_x,
+        const uint32_t stride_row_x, const uint32_t stride_col_y, const uint32_t stride_col_dst,
+        const uint32_t stride_channel_x, const uint32_t stride_channel_y, const uint32_t stride_channel_dst,
+        const uint32_t ncols_dst, const uint32_t ids_stride,
+        const int warp_size, const int nchannels_dst, cudaStream_t stream) {
+
+    constexpr int rows_per_block = 2; // 2 gives best perf based on tuning
+    const int64_t nblocks_rows = (nrows_x + rows_per_block - 1) / rows_per_block;
+    const dim3 block_nums(nblocks_rows, nchannels_dst + (fusion.shared_up != nullptr));
+    const dim3 block_dims(warp_size, ncols_dst);
+    const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(block_nums, block_dims, 0, stream);
+
+    const bool has_fusion = fusion.gate != nullptr || fusion.x_bias != nullptr || fusion.gate_bias != nullptr ||
+                            fusion.x_scale != nullptr || fusion.gate_scale != nullptr;
+
+#ifdef GGML_CUDA_NVRTC
+    static const std::string expressions[] = {
+        ggml_cuda_mmvq_moe_kernel_expression(type, false),
+        ggml_cuda_mmvq_moe_kernel_expression(type, true),
+    };
+    ggml_cuda_nvrtc_launch("mmvq.cu", expressions[has_fusion], launch_params, 0, true,
+        vx, vy, ids, fusion, dst, ncols_x, nchannels_y, nrows_x,
+        stride_row_x, stride_col_y, stride_col_dst,
+        stride_channel_x, stride_channel_y, stride_channel_dst,
+        ncols_dst, ids_stride);
+#else
+    if (has_fusion) {
+        ggml_cuda_kernel_launch(mul_mat_vec_q_moe<type, rows_per_block, true>, launch_params,
+            vx, vy, ids, fusion, dst, ncols_x, nchannels_y, nrows_x,
+            stride_row_x, stride_col_y, stride_col_dst,
+            stride_channel_x, stride_channel_y, stride_channel_dst,
+            ncols_dst, ids_stride);
+    } else {
+        ggml_cuda_kernel_launch(mul_mat_vec_q_moe<type, rows_per_block, false>, launch_params,
+            vx, vy, ids, fusion, dst, ncols_x, nchannels_y, nrows_x,
+            stride_row_x, stride_col_y, stride_col_dst,
+            stride_channel_x, stride_channel_y, stride_channel_dst,
+            ncols_dst, ids_stride);
+    }
+#endif
+}
+
+template <ggml_type type>
+static void mul_mat_vec_q_switch_ncols_dst(
+        const void * vx, const void * vy, const int32_t * ids, const ggml_cuda_mm_fusion_args_device fusion, float * dst,
+        const int ncols_x, const int nrows_x, const int ncols_dst,
+        const int stride_row_x, const int stride_col_y, const int stride_col_dst,
+        const int nchannels_x, const int nchannels_y, const int nchannels_dst,
+        const int stride_channel_x, const int stride_channel_y, const int stride_channel_dst,
+        const int nsamples_x, const int nsamples_dst, const int stride_sample_x, const int stride_sample_y, const int stride_sample_dst,
+        const int ids_stride, cudaStream_t stream) {
+
+    GGML_ASSERT(ncols_x % ggml_blck_size(type) == 0);
+    GGML_ASSERT(ncols_dst <= MMVQ_MAX_BATCH_SIZE);
+
+    const uint3 nchannels_y_fd   = ids ? init_fastdiv_values(nchannels_y) : make_uint3(0, 0, 0);
+    const uint3 channel_ratio_fd = ids ? make_uint3(0, 0, 0)              : init_fastdiv_values(nchannels_dst / nchannels_x);
+    const uint3 sample_ratio_fd  = init_fastdiv_values(nsamples_dst  / nsamples_x);
+
+    const int device = ggml_cuda_get_device();
+    const int                     cc        = ggml_cuda_info().devices[device].cc;
+    const int warp_size = ggml_cuda_info().devices[device].warp_size;
+    const mmvq_parameter_table_id table_id  = get_device_table_id(cc);
+
+    const bool has_ids = ids != nullptr;
+
+    const auto ncols1_flags = ncols_dst == 1 ? mmvq_ncols1_flags<type>(cc, warp_size, ncols_x, has_ids) : std::pair<bool, bool>{ false, false };
 
     if (has_ids && ncols_dst > 1) {
         // Multi-token MUL_MAT_ID path - dedicated MoE kernel
@@ -1233,9 +1346,9 @@ static void mul_mat_vec_q_switch_ncols_dst(
                     stream);
             };
 
-            if (should_use_small_k(c_ncols_dst)) {
+            if (ncols1_flags.first) {
                 launch(std::true_type{},  std::false_type{});
-            } else if (should_halve_iters()) {
+            } else if (ncols1_flags.second) {
                 launch(std::false_type{}, std::true_type{});
             } else {
                 launch(std::false_type{}, std::false_type{});
@@ -1617,3 +1730,4 @@ void ggml_cuda_op_mul_mat_vec_q(
 
     GGML_UNUSED_VARS(src1, dst, src1_ddf_i, src1_ncols, src1_padded_row_size);
 }
+#endif // !__CUDACC_RTC__

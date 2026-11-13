@@ -2,8 +2,10 @@
 #include "common.cuh"
 #include "unary.cuh"
 #include "mmvf.cuh"
-#include "mmf.cuh"
 #include "convert.cuh"
+#ifndef __CUDACC_RTC__
+#include "mmf.cuh"
+#endif
 
 static __device__ __forceinline__ float2 mmvf_load_fp8x2(const ggml_fp8_e4m3_t * x, const int col2) {
 #if defined(FP8_AVAILABLE) && !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
@@ -439,6 +441,121 @@ static __global__ void mul_mat_vec_f(
     }
 }
 
+#ifndef __CUDACC_RTC__
+#ifdef GGML_CUDA_NVRTC
+#include "nvrtc-kernels.cuh"
+#include "ggml-backend.h"
+#include <mutex>
+
+static int mmvf_block_size(int64_t ncols, int cc, int warp_size) {
+    int64_t block_size_best = warp_size;
+    int64_t niter_best      = (ncols + 2*warp_size - 1) / (2*warp_size);
+    int64_t max_block_size  = 256;
+    if(cc > GGML_CUDA_CC_OFFSET_AMD && cc < GGML_CUDA_CC_RDNA1) {
+        max_block_size = 128;
+    }
+    for (int64_t block_size = 2*warp_size; block_size <= max_block_size; block_size += warp_size) {
+        const int64_t niter = (ncols + 2*block_size - 1) / (2*block_size);
+        if (niter < niter_best) {
+            niter_best      = niter;
+            block_size_best = block_size;
+        }
+    }
+
+    return (int) block_size_best;
+}
+
+static const std::string & mmvf_expression(ggml_type type, bool half_acc, int cols, int block, bool fusion, bool multi_id) {
+    GGML_ASSERT(cols >= 1 && cols <= 8 && block >= 32 && block <= 256 && block % 32 == 0);
+    struct recipe { std::once_flag init; std::string expression; };
+    static recipe recipes[4 * 2 * 8 * 8 * 2 * 2];
+    const int ti = type == GGML_TYPE_F32 ? 0 : type == GGML_TYPE_F16 ? 1 : type == GGML_TYPE_BF16 ? 2 : 3;
+    const int index = (((((ti * 2 + half_acc) * 8 + cols - 1) * 8 + block/32 - 1) * 2 + fusion) * 2 + multi_id);
+    auto & result = recipes[index];
+    std::call_once(result.init, [&] {
+        const char * types[] = { "float", "half", "nv_bfloat16", "ggml_fp8_e4m3_t" };
+        result.expression = std::string("mul_mat_vec_f<") + types[ti] + "," + (half_acc ? "half" : "float") + "," +
+            std::to_string(cols) + "," + std::to_string(block) + "," + (fusion ? "true" : "false") + "," + (multi_id ? "true" : "false") + ">";
+    });
+    return result.expression;
+}
+
+void ggml_cuda_nvrtc_mmvf_prepare(int device, const ggml_tensor * weight, bool has_ids, bool static_weight) {
+    if (weight->type != GGML_TYPE_F32 && weight->type != GGML_TYPE_F16 && weight->type != GGML_TYPE_BF16 && weight->type != GGML_TYPE_F8_E4M3) {
+        return;
+    }
+    if (weight->ne[0] <= 0 || weight->ne[0] % 2 != 0) {
+        return;
+    }
+    const auto & info = ggml_cuda_info().devices[device];
+    std::vector<int> blocks;
+    const bool fixed = static_weight || (weight->buffer && ggml_backend_buffer_get_usage(weight->buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+    if (fixed) {
+        blocks.push_back(mmvf_block_size(weight->ne[0], info.cc, info.warp_size));
+    } else {
+        for (int k = 2; k <= std::min<int64_t>(weight->ne[0], 512); k += 2) {
+            const int block = mmvf_block_size(k, info.cc, info.warp_size);
+            if (std::find(blocks.begin(), blocks.end(), block) == blocks.end()) {
+                blocks.push_back(block);
+            }
+        }
+    }
+    std::vector<std::string> expressions;
+    for (int cols = 1; cols <= (has_ids ? 1 : MMVF_MAX_BATCH_SIZE); ++cols) {
+        if (!has_ids && fixed && !ggml_cuda_should_use_mmvf(weight, info.cc, info.warp_size, cols)) {
+            continue;
+        }
+        for (bool half_acc : { false, true }) {
+            if (half_acc && (weight->type != GGML_TYPE_F16 || !fast_fp16_available(info.cc))) {
+                continue;
+            }
+            for (int block : blocks) {
+                for (bool multi_id : { false, true }) {
+                    if (multi_id && !has_ids) {
+                        continue;
+                    }
+                    expressions.push_back(mmvf_expression(weight->type, half_acc, cols, block, false, multi_id));
+                    if (cols == 1) {
+                        expressions.push_back(mmvf_expression(weight->type, half_acc, cols, block, true, multi_id));
+                    }
+                }
+            }
+        }
+    }
+    ggml_cuda_nvrtc_enqueue(device, "mmvf.cu", expressions);
+}
+
+static void launch_mmvf_nvrtc(
+        ggml_type type, bool half_acc, const void * x, const float * y, const int32_t * ids,
+        const ggml_cuda_mm_fusion_args_device fusion, float * dst,
+        int64_t ncols, int64_t nrows, int64_t ncols_dst,
+        int64_t stride_row, int64_t stride_col_y, int64_t stride_col_dst,
+        int64_t nchannels_x, int64_t nchannels_y, int64_t nchannels_dst,
+        int64_t stride_channel_x, int64_t stride_channel_y, int64_t stride_channel_dst,
+        int64_t nsamples_x, int64_t nsamples_dst, int64_t stride_sample_x, int64_t stride_sample_y,
+        int64_t stride_sample_dst, int64_t ids_stride, cudaStream_t stream) {
+    GGML_ASSERT(ncols % 2 == 0 && stride_row % 2 == 0 && stride_col_y % 2 == 0);
+    GGML_ASSERT(ids || nchannels_dst % nchannels_x == 0);
+    GGML_ASSERT(nsamples_dst % nsamples_x == 0);
+    const auto & info = ggml_cuda_info().devices[ggml_cuda_get_device()];
+    const bool multi_id = ids && ncols_dst > 1;
+    const int cols = ids ? 1 : (int) ncols_dst;
+    const int block = mmvf_block_size(ncols, info.cc, info.warp_size);
+    const bool fusion_shared = fusion.gate || fusion.x_bias || fusion.gate_bias;
+    const bool has_fusion = fusion_shared || fusion.x_scale || fusion.gate_scale;
+    GGML_ASSERT(!has_fusion || cols == 1);
+    const int shared = info.warp_size * sizeof(float) * (fusion_shared ? 2 : 1);
+    const dim3 grid(nrows, nchannels_dst, ids ? ncols_dst : nsamples_dst);
+    const ggml_cuda_kernel_launch_params params(grid, dim3(block, 1, 1), shared, stream);
+    ggml_cuda_nvrtc_launch("mmvf.cu", mmvf_expression(type, half_acc, cols, block, has_fusion, multi_id), params, 0, true,
+        x, y, ids, fusion, dst, (int) (ncols/2), ids ? init_fastdiv_values(nchannels_y) : make_uint3(0, 0, 0),
+        (int) stride_row, (int) (stride_col_y/2), (int) stride_col_dst,
+        ids ? make_uint3(0, 0, 0) : init_fastdiv_values(nchannels_dst/nchannels_x),
+        (int) stride_channel_x, (int) stride_channel_y, (int) stride_channel_dst,
+        init_fastdiv_values(nsamples_dst/nsamples_x), (int) stride_sample_x, (int) stride_sample_y,
+        (int) stride_sample_dst, (int) ids_stride);
+}
+#else
 template<typename T, typename type_acc, int ncols_dst, int block_size, bool is_multi_token_id = false>
 static void mul_mat_vec_f_switch_fusion(
         const T * x, const float * y, const int32_t * ids, const ggml_cuda_mm_fusion_args_device fusion, float * dst,
@@ -661,6 +778,8 @@ static void mul_mat_vec_f_cuda_switch_ncols_dst(
     }
 }
 
+#endif // GGML_CUDA_NVRTC
+
 template<typename T>
 static void mul_mat_vec_f_cuda(
         const T * x, const float * y, const int32_t * ids, const ggml_cuda_mm_fusion_args_device fusion, float * dst,
@@ -671,6 +790,14 @@ static void mul_mat_vec_f_cuda(
         const int64_t nsamples_dst, const int64_t stride_sample_x, const int64_t stride_sample_y, const int64_t stride_sample_dst,
         const int64_t ids_stride, enum ggml_prec prec, cudaStream_t stream) {
 
+#ifdef GGML_CUDA_NVRTC
+    constexpr ggml_type type = std::is_same_v<T, float> ? GGML_TYPE_F32 : std::is_same_v<T, half> ? GGML_TYPE_F16 :
+        std::is_same_v<T, nv_bfloat16> ? GGML_TYPE_BF16 : GGML_TYPE_F8_E4M3;
+    const bool half_acc = std::is_same_v<T, half> && prec == GGML_PREC_UNDEFINED;
+    launch_mmvf_nvrtc(type, half_acc, x, y, ids, fusion, dst, ncols, nrows, ncols_dst, stride_row, stride_col_y,
+        stride_col_dst, nchannels_x, nchannels_y, nchannels_dst, stride_channel_x, stride_channel_y,
+        stride_channel_dst, nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, stream);
+#else
     if constexpr(std::is_same_v<T, half>) {
         if (prec == GGML_PREC_UNDEFINED) {
             mul_mat_vec_f_cuda_switch_ncols_dst<T, half>
@@ -684,6 +811,7 @@ static void mul_mat_vec_f_cuda(
         (x, y, ids, fusion, dst, ncols, nrows, ncols_dst, stride_row, stride_col_y, stride_col_dst,
         nchannels_x, nchannels_y, nchannels_dst, stride_channel_x, stride_channel_y,
         stride_channel_dst, nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, stream);
+#endif
 }
 
 void ggml_cuda_mul_mat_vec_f(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst,
@@ -979,3 +1107,5 @@ bool ggml_cuda_should_use_mmvf(const ggml_tensor * src0, int cc, int warp_size, 
             return false;
     }
 }
+
+#endif // !__CUDACC_RTC__

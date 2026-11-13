@@ -7,6 +7,10 @@
 #include <climits>
 #include <cstdint>
 
+#if defined(GGML_CUDA_NVRTC) && !defined(__CUDACC_RTC__)
+#include "nvrtc-kernels.cuh"
+#endif
+
 #define MMQ_DP4A_MAX_BATCH_SIZE 64 // Max. batch size to use for dp4a MMQ kernels when FP16 tensor cores are available.
 #define MMQ_ITER_K             256
 #define MMQ_ITER_K_FP4         512
@@ -61,6 +65,7 @@ static_assert(sizeof(block_q8_1_mmq) == QK8_1_MMQ + 4*sizeof(half2), "Unexpected
 static_assert(sizeof(block_q8_1_mmq) == 4*sizeof(block_q8_1),      "Unexpected block_q8_1_mmq size");
 static_assert(sizeof(block_fp4_mmq)  == sizeof(block_q8_1_mmq),    "Unexpected block_fp4_mmq size");
 
+#ifndef __CUDACC_RTC__
 static mmq_q8_1_ds_layout mmq_get_q8_1_ds_layout(const ggml_type type_x) {
     switch (type_x) {
         case GGML_TYPE_Q1_0:
@@ -102,6 +107,7 @@ static mmq_q8_1_ds_layout mmq_get_q8_1_ds_layout(const ggml_type type_x) {
             GGML_ABORT("fatal error");
     }
 }
+#endif
 
 struct tile_x_sizes {
     int qs;
@@ -189,12 +195,14 @@ struct ggml_cuda_mmq_config {
     }
 
     // TODO transition all combinations of GPUs and quantizations to the MMA data layout.
+#ifndef __CUDACC_RTC__
     __host__ int use_mma_data_layout(const int cc) const {
         if (amd_mfma_available(cc) || amd_wmma_available(cc) || turing_mma_available(cc)) {
             return true;
         }
         return false;
     }
+#endif
 
     constexpr __device__ bool use_mma_data_layout() const {
 #if defined(AMD_MFMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE)
@@ -230,6 +238,7 @@ struct ggml_cuda_mmq_config {
 
 #undef CASE
 
+#ifndef __CUDACC_RTC__
 static __host__ ggml_cuda_mmq_config ggml_cuda_mmq_get_config(const ggml_type type, const int J, const bool fallback, const int cc, const ggml_prec prec_src1) {
     if (GGML_CUDA_CC_IS_AMD(cc)) {
         if (GGML_CUDA_CC_IS_GCN(cc)) {
@@ -267,6 +276,7 @@ static __host__ ggml_cuda_mmq_config ggml_cuda_mmq_get_config(const ggml_type ty
     }
     return ggml_cuda_mmq_get_config_pascal_older(type, J, fallback);
 }
+#endif
 
 static constexpr __device__ ggml_cuda_mmq_config ggml_cuda_mmq_get_config(ggml_type type, int J, bool fallback, ggml_prec prec_src1) {
 #ifdef GGML_USE_HIP
@@ -307,9 +317,11 @@ static constexpr __device__ ggml_cuda_mmq_config ggml_cuda_mmq_get_config(ggml_t
     GGML_UNUSED_VARS(type, J, fallback, prec_src1);
 }
 
+#ifndef __CUDACC_RTC__
 static __host__ int ggml_cuda_mmq_get_type(const ggml_type type, const int J, const bool fallback, const int cc, const ggml_prec prec_src1) {
     return ggml_cuda_mmq_get_config(type, J, fallback, cc, prec_src1).type;
 }
+#endif
 
 static constexpr __device__ int ggml_cuda_mmq_get_type(ggml_type type, int J, bool fallback, ggml_prec prec_src1) {
     return ggml_cuda_mmq_get_config(type, J, fallback, prec_src1).type;
@@ -323,49 +335,61 @@ static constexpr __device__ int ggml_cuda_mmq_get_occupancy(ggml_type type, int 
     return ggml_cuda_mmq_get_config(type, J, fallback, prec_src1).occupancy;
 }
 
+#ifndef __CUDACC_RTC__
 static __host__ int ggml_cuda_mmq_get_I(const ggml_type type, const int J, const bool fallback, const int cc, const ggml_prec prec_src1) {
     return ggml_cuda_mmq_get_config(type, J, fallback, cc, prec_src1).I;
 }
+#endif
 
 static constexpr __device__ int ggml_cuda_mmq_get_I(ggml_type type, int J, bool fallback, ggml_prec prec_src1) {
     return ggml_cuda_mmq_get_config(type, J, fallback, prec_src1).I;
 }
 
+#ifndef __CUDACC_RTC__
 static __host__ int ggml_cuda_mmq_get_J(const ggml_type type, const int J, const bool fallback, const int cc, const ggml_prec prec_src1) {
     return ggml_cuda_mmq_get_config(type, J, fallback, cc, prec_src1).J;
 }
+#endif
 
 static constexpr __device__ int ggml_cuda_mmq_get_J(ggml_type type, int J, bool fallback, ggml_prec prec_src1) {
     return ggml_cuda_mmq_get_config(type, J, fallback, prec_src1).J;
 }
 
+#ifndef __CUDACC_RTC__
 static __host__ ggml_cuda_mmq_sram_layout ggml_cuda_mmq_get_sram_layout(const ggml_type type, const int J, const bool fallback, const int cc, const ggml_prec prec_src1) {
     return ggml_cuda_mmq_get_config(type, J, fallback, cc, prec_src1).sram_layout;
 }
+#endif
 
 static constexpr __device__ ggml_cuda_mmq_sram_layout ggml_cuda_mmq_get_sram_layout(ggml_type type, int J, bool fallback, ggml_prec prec_src1) {
     return ggml_cuda_mmq_get_config(type, J, fallback, prec_src1).sram_layout;
 }
 
+#ifndef __CUDACC_RTC__
 static __host__ int ggml_cuda_mmq_get_K_vram(const ggml_type type, const int J, const bool fallback, const int cc, const ggml_prec prec_src1) {
     return ggml_cuda_mmq_get_config(type, J, fallback, cc, prec_src1).K_vram;
 }
+#endif
 
 static constexpr __device__ int ggml_cuda_mmq_get_K_vram(ggml_type type, int J, bool fallback, ggml_prec prec_src1) {
     return ggml_cuda_mmq_get_config(type, J, fallback, prec_src1).K_vram;
 }
 
+#ifndef __CUDACC_RTC__
 static __host__ bool ggml_cuda_mmq_get_stream_k(const ggml_type type, const int J, const bool fallback, const int cc, const ggml_prec prec_src1) {
     return ggml_cuda_mmq_get_config(type, J, fallback, cc, prec_src1).stream_k;
 }
+#endif
 
 static constexpr __device__ bool ggml_cuda_mmq_get_stream_k(ggml_type type, int J, bool fallback, ggml_prec prec_src1) {
     return ggml_cuda_mmq_get_config(type, J, fallback, prec_src1).stream_k;
 }
 
+#ifndef __CUDACC_RTC__
 static __host__ int ggml_cuda_mmq_get_fallback(const ggml_type type, const int J, const bool fallback, const int cc, const ggml_prec prec_src1) {
     return ggml_cuda_mmq_get_config(type, J, fallback, cc, prec_src1).fallback;
 }
+#endif
 
 static constexpr __device__ int ggml_cuda_mmq_get_fallback(ggml_type type, int J, bool fallback, ggml_prec prec_src1) {
     return ggml_cuda_mmq_get_config(type, J, fallback, prec_src1).fallback;
@@ -373,17 +397,21 @@ static constexpr __device__ int ggml_cuda_mmq_get_fallback(ggml_type type, int J
 
 // ---------------------------------------------------------------------------------------------
 
+#ifndef __CUDACC_RTC__
 static __host__ int ggml_cuda_mmq_get_sram_stride(const ggml_type type, const int J, const bool fallback, const int cc, const ggml_prec prec_src1) {
     return ggml_cuda_mmq_get_sram_stride(ggml_cuda_mmq_get_sram_layout(type, J, fallback, cc, prec_src1));
 }
+#endif
 
 static constexpr __device__ int ggml_cuda_mmq_get_sram_stride(ggml_type type, int J, bool fallback, ggml_prec prec_src1) {
     return ggml_cuda_mmq_get_sram_stride(ggml_cuda_mmq_get_sram_layout(type, J, fallback, prec_src1));
 }
 
+#ifndef __CUDACC_RTC__
 static __host__ bool ggml_cuda_mmq_needs_fallback(const int64_t nrows_x) {
     return nrows_x % 128 != 0;
 }
+#endif
 
 static constexpr __device__ int ggml_cuda_mmq_get_rows_per_warp(ggml_type type, int J, bool fallback, ggml_prec prec_src1) {
     return ggml_cuda_mmq_get_config(type, J, fallback, prec_src1).rows_per_warp();
@@ -429,6 +457,7 @@ static constexpr __host__ __device__ tile_x_sizes mmq_get_dp4a_tile_x_sizes(ggml
 }
 
 // FIXME temporary until all combinations of data types and GPUs can use the MMA data layout
+#ifndef __CUDACC_RTC__
 static __host__ int ggml_cuda_mmq_get_nbytes_shared_x(const ggml_cuda_mmq_config & config, const int cc) {
     if (config.use_mma_data_layout(cc)) {
         return config.I * ggml_cuda_mmq_get_sram_stride(config.sram_layout) * 4;
@@ -436,6 +465,7 @@ static __host__ int ggml_cuda_mmq_get_nbytes_shared_x(const ggml_cuda_mmq_config
     const tile_x_sizes txs = mmq_get_dp4a_tile_x_sizes(config.type, config.I);
     return (txs.qs + txs.dm + txs.sc) * 4;
 }
+#endif
 
 // ------------------------------------------------------------
 
@@ -1432,6 +1462,8 @@ static __global__ void mul_mat_q_stream_k_fixup(
     }
 }
 
+#ifndef __CUDACC_RTC__
+
 struct mmq_args {
     const char * x; ggml_type type_x; const int * y; const int32_t * ids_dst;
     const ggml_cuda_mm_id_tile_spec * tile_spec; float * dst; const float * y_scale;
@@ -1450,6 +1482,19 @@ static size_t mmq_get_nbytes_shared(const ggml_cuda_mmq_config & config, const i
     return nbs_ids + nbs_x + GGML_PAD(nbs_y, config.nthreads*sizeof(int));
 }
 
+#ifdef GGML_CUDA_NVRTC
+static std::string ggml_cuda_mmq_kernel_expression(
+        const char * name, ggml_type type, int J, bool fallback, ggml_prec prec_src1, bool has_fusion = false) {
+    std::string expression = std::string(name) + "<(ggml_type)" + std::to_string(type) + "," + std::to_string(J) + "," +
+        (fallback ? "true" : "false") + ",(ggml_prec)" + std::to_string(prec_src1);
+    if (strcmp(name, "mul_mat_q") == 0) {
+        expression += has_fusion ? ",true" : ",false";
+    }
+    return expression + ">";
+}
+#endif
+
+#ifndef GGML_CUDA_NVRTC
 template <ggml_type type, int J, bool fallback, ggml_prec prec_src1, bool has_fusion>
 static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream) {
     const int id = ggml_cuda_get_device();
@@ -1464,10 +1509,14 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
 
     const dim3 block_dims(warp_size, nwarps, 1);
 
+#ifdef GGML_CUDA_NVRTC
+    static const std::string expression = ggml_cuda_mmq_kernel_expression("mul_mat_q", type, J, fallback, prec_src1, has_fusion);
+#else
     CUDA_SET_SHARED_MEMORY_LIMIT((mul_mat_q<type, J, /*fallback =*/ false, prec_src1, has_fusion>), nbytes_shared);
     if constexpr (!has_fusion) {
         CUDA_SET_SHARED_MEMORY_LIMIT((mul_mat_q<type, J, /*fallback =*/ true, prec_src1, false>), nbytes_shared);
     }
+#endif
 
     const int I_dst = has_fusion ? config.I/2 : config.I; // Rows of dst per tile, see mul_mat_q.
     const int nti   = (args.nrows_x + I_dst - 1) / I_dst;
@@ -1489,12 +1538,18 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
 
     if (has_fusion || !config.stream_k) {
         GGML_ASSERT(nti <= 65535); // gridDim.y limit
+#ifdef GGML_CUDA_NVRTC
+        ggml_cuda_nvrtc_launch("mmq.cuh", expression,
+            ggml_cuda_kernel_launch_params(block_nums_xy_tiling, block_dims, nbytes_shared, stream), nbytes_shared, false,
+#else
         mul_mat_q<type, J, fallback, prec_src1, has_fusion><<<block_nums_xy_tiling, block_dims, nbytes_shared, stream>>>
-            (args.x, (const char *) args.fusion.gate, args.y, args.ids_dst, args.tile_spec, args.dst, nullptr,
+            (
+#endif
+             args.x, (const char *) args.fusion.gate, args.y, args.ids_dst, args.tile_spec, args.dst, (float *) nullptr,
              args.y_scale, args.fusion.glu_op, args.fusion.glu_limit, (const float *) args.fusion.x_scale, (const float *) args.fusion.gate_scale,
-             blocks_per_ne00_fd, args.nrows_x, args.ncols_dst, args.stride_row_x, args.ncols_y, args.nrows_dst,
-             channel_ratio_fd, nchannels_y_fd, args.stride_channel_x, args.stride_channel_y, args.stride_channel_dst,
-             sample_ratio_fd, nsamples_y_fd, args.stride_sample_x, args.stride_sample_y, args.stride_sample_dst,
+             blocks_per_ne00_fd, (int) args.nrows_x, (int) args.ncols_dst, (int) args.stride_row_x, (int) args.ncols_y, (int) args.nrows_dst,
+             channel_ratio_fd, nchannels_y_fd, (int) args.stride_channel_x, (int) args.stride_channel_y, (int) args.stride_channel_dst,
+             sample_ratio_fd, nsamples_y_fd, (int) args.stride_sample_x, (int) args.stride_sample_y, (int) args.stride_sample_dst,
              ntj_fd);
         return;
     }
@@ -1521,12 +1576,18 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
     const dim3 block_nums_fixup(block_nums_stream_k.x, config.I/warp_size, 1);
     const dim3 block_dims_fixup(block_dims.x, block_dims.y/2, block_dims.z);
 
+#ifdef GGML_CUDA_NVRTC
+    ggml_cuda_nvrtc_launch("mmq.cuh", expression,
+        ggml_cuda_kernel_launch_params(block_nums_stream_k, block_dims, nbytes_shared, stream), nbytes_shared, false,
+#else
     mul_mat_q<type, J, fallback, prec_src1, has_fusion><<<block_nums_stream_k, block_dims, nbytes_shared, stream>>>
-        (args.x, (const char *) args.fusion.gate, args.y, args.ids_dst, args.tile_spec, args.dst, tmp_fixup.ptr,
+        (
+#endif
+         args.x, (const char *) args.fusion.gate, args.y, args.ids_dst, args.tile_spec, args.dst, tmp_fixup.ptr,
          args.y_scale, args.fusion.glu_op, args.fusion.glu_limit, (const float *) args.fusion.x_scale, (const float *) args.fusion.gate_scale,
-         blocks_per_ne00_fd, args.nrows_x, args.ncols_dst, args.stride_row_x, args.ncols_y, args.nrows_dst,
-         channel_ratio_fd, nchannels_y_fd, args.stride_channel_x, args.stride_channel_y, args.stride_channel_dst,
-         sample_ratio_fd, nsamples_y_fd, args.stride_sample_x, args.stride_sample_y, args.stride_sample_dst,
+         blocks_per_ne00_fd, (int) args.nrows_x, (int) args.ncols_dst, (int) args.stride_row_x, (int) args.ncols_y, (int) args.nrows_dst,
+         channel_ratio_fd, nchannels_y_fd, (int) args.stride_channel_x, (int) args.stride_channel_y, (int) args.stride_channel_dst,
+         sample_ratio_fd, nsamples_y_fd, (int) args.stride_sample_x, (int) args.stride_sample_y, (int) args.stride_sample_dst,
          ntj_fd);
 
     if (!fixup_needed) {
@@ -1534,9 +1595,16 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
     }
 
     CUDA_CHECK(cudaGetLastError());
+#ifdef GGML_CUDA_NVRTC
+    static const std::string fixup_expression = ggml_cuda_mmq_kernel_expression("mul_mat_q_stream_k_fixup", type, J, fallback, prec_src1);
+    ggml_cuda_nvrtc_launch("mmq.cuh", fixup_expression,
+        ggml_cuda_kernel_launch_params(block_nums_fixup, block_dims_fixup, 0, stream), 0, false,
+#else
     mul_mat_q_stream_k_fixup<type, J, fallback, prec_src1><<<block_nums_fixup, block_dims_fixup, 0, stream>>>
-        (args.ids_dst, args.tile_spec, args.dst, tmp_fixup.ptr, blocks_per_ne00_fd, args.nrows_x, args.ncols_dst,
-         args.nrows_dst, nchannels_y_fd, args.stride_channel_dst, nsamples_y_fd, args.stride_sample_dst,
+        (
+#endif
+         args.ids_dst, args.tile_spec, args.dst, tmp_fixup.ptr, blocks_per_ne00_fd, (int) args.nrows_x, (int) args.ncols_dst,
+         (int) args.nrows_dst, nchannels_y_fd, (int) args.stride_channel_dst, nsamples_y_fd, (int) args.stride_sample_dst,
          ntj_fd);
 }
 
@@ -1620,6 +1688,8 @@ void mul_mat_q_case(ggml_backend_cuda_context & ctx, const mmq_args & args, cuda
     }
 }
 
+#endif // !GGML_CUDA_NVRTC
+
 #define DECL_MMQ_CASE(type)                                                        \
     template void mul_mat_q_case<type, GGML_PREC_Q8>(ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream) \
 
@@ -1627,6 +1697,7 @@ void mul_mat_q_case(ggml_backend_cuda_context & ctx, const mmq_args & args, cuda
 #define DECL_MMQ_CASE_W4A4(type)                                                   \
     template void mul_mat_q_case<type, GGML_PREC_Q4>(ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream) \
 
+#ifndef GGML_CUDA_NVRTC
 extern DECL_MMQ_CASE(GGML_TYPE_Q1_0);
 extern DECL_MMQ_CASE(GGML_TYPE_Q2_0);
 extern DECL_MMQ_CASE(GGML_TYPE_Q4_0);
@@ -1654,6 +1725,7 @@ extern DECL_MMQ_CASE(GGML_TYPE_MXFP4);
 extern DECL_MMQ_CASE(GGML_TYPE_NVFP4);
 extern DECL_MMQ_CASE_W4A4(GGML_TYPE_MXFP4);
 extern DECL_MMQ_CASE_W4A4(GGML_TYPE_NVFP4);
+#endif
 
 // -------------------------------------------------------------------------------------------------------------------------
 
@@ -1665,3 +1737,9 @@ bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t
 
 // prec_requested: the src1 precision requested by the fused MUL_MATs.
 bool ggml_cuda_mmq_fusion_is_efficient(ggml_type type, ggml_prec prec_requested, int64_t nrows_x, int64_t ncols, int64_t nchannels, int device);
+
+#ifdef GGML_CUDA_NVRTC
+void ggml_cuda_nvrtc_mmq_prepare(int device, ggml_type type, int64_t ncols_x, int64_t nrows_x);
+#endif
+
+#endif // __CUDACC_RTC__
