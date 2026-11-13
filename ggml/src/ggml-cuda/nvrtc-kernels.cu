@@ -15,7 +15,20 @@
 #include <stdexcept>
 #include <thread>
 #include <unordered_set>
-#include <unistd.h>
+#ifdef _WIN32
+#    ifndef WIN32_LEAN_AND_MEAN
+#        define WIN32_LEAN_AND_MEAN
+#    endif
+#    ifndef NOMINMAX
+#        define NOMINMAX
+#    endif
+#    include <windows.h>
+#    include <process.h>
+static inline int ggml_nvrtc_getpid() { return _getpid(); }
+#else
+#    include <unistd.h>
+static inline int ggml_nvrtc_getpid() { return (int) getpid(); }
+#endif
 
 #include "nvrtc-sources.h"
 
@@ -98,6 +111,10 @@ static std::filesystem::path cache_path(const std::string & id) {
         path = std::filesystem::path(xdg) / "ggml-nvrtc-kernels";
     } else if (const char * home = getenv("HOME")) {
         path = std::filesystem::path(home) / ".cache/ggml-nvrtc-kernels";
+#ifdef _WIN32
+    } else if (const char * local = getenv("LOCALAPPDATA")) {
+        path = std::filesystem::path(local) / "ggml-nvrtc-kernels";
+#endif
     } else {
         return {};
     }
@@ -218,7 +235,7 @@ static std::shared_ptr<compiled_kernel> compile_job(const kernel_job & job) {
     }
     if (!path.empty()) {
         // Publish the manifest last; a partial entry is treated as a miss.
-        const std::string suffix = ".tmp." + std::to_string(getpid()) + "." + std::to_string((uintptr_t) result.get());
+        const std::string suffix = ".tmp." + std::to_string(ggml_nvrtc_getpid()) + "." + std::to_string((uintptr_t) result.get());
         const auto temp = path.string() + suffix;
         std::ofstream image(temp, std::ios::binary);
         image.write(result->image.data(), result->image.size());
