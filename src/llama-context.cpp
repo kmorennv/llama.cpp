@@ -27,6 +27,10 @@
 // llama_context
 //
 
+struct llama_context_dependency_error : std::runtime_error {
+    using std::runtime_error::runtime_error;
+};
+
 // check that each folded weight in the graph gets its Hadamard transform, and each latent lookup gets the inverse
 // without this check, an arch that skips the transform helpers loads and computes wrong results
 static void llama_verify_hadamard_graph(
@@ -168,8 +172,10 @@ static const llm_fused_op_probe llm_fused_op_top_k_mask_probe = {
 
 llama_context::llama_context(
         const llama_model & model,
-              llama_context_params params) :
+        llama_context_params params,
+        llama_context_init_mode mode) :
     model(model),
+    init_mode(model.no_alloc() ? llama_context_init_mode::MEASURE : mode),
     cvec(std::make_unique<llama_adapter_cvec>()),
     loras(std::make_unique<llama_adapter_loras>()),
     // MTP uses the embd input for the hidden state
@@ -177,7 +183,8 @@ llama_context::llama_context(
                 llm_arch_supports_mixed_batch(model.arch) && params.ctx_type == LLAMA_CONTEXT_TYPE_DEFAULT)) {
     // TODO warning when creating llama_context with awkward ctx size that is not a power of 2,
     //     may need to be backend-dependent
-    LLAMA_LOG_INFO("%s: constructing llama_context\n", __func__);
+    LLAMA_LOG_INFO("%s: constructing llama_context%s\n", __func__,
+            init_mode == llama_context_init_mode::DISCOVER ? " for kernel discovery" : "");
 
     t_start_us = model.t_start_us;
     t_load_us  = model.t_load_us;
@@ -237,7 +244,7 @@ llama_context::llama_context(
     if (model.arch == LLM_ARCH_GEMMA4_ASSISTANT) {
         if (params.ctx_other == nullptr) {
             // TODO: change from runtime_error to llama_exception to avoid printing error message
-            throw std::runtime_error("Gemma4Assistant requires ctx_other to be set (this warning is normal during memory fitting)");
+            throw llama_context_dependency_error("Gemma4Assistant requires ctx_other to be set (this warning is normal during memory fitting)");
         }
 
         cparams.ctx_other = params.ctx_other;
@@ -246,7 +253,7 @@ llama_context::llama_context(
     if (model.arch == LLM_ARCH_EAGLE3 || model.arch == LLM_ARCH_DFLASH) {
         if (model.tok_embd == nullptr || model.output == nullptr) {
             if (params.ctx_other == nullptr) {
-                throw std::runtime_error(model.arch_name() + " requires ctx_other to be set (this warning is normal during memory fitting)");
+                throw llama_context_dependency_error(model.arch_name() + " requires ctx_other to be set (this warning is normal during memory fitting)");
             }
             cparams.ctx_other = params.ctx_other;
         } else if (model.arch == LLM_ARCH_DFLASH) {
@@ -506,10 +513,12 @@ llama_context::llama_context(
             }
         }
 
-        llama_set_abort_callback(this, params.abort_callback, params.abort_callback_data);
+        if (init_mode != llama_context_init_mode::DISCOVER) {
+            llama_set_abort_callback(this, params.abort_callback, params.abort_callback_data);
+        }
 
         // graph outputs buffer
-        {
+        if (init_mode != llama_context_init_mode::DISCOVER) {
             if (output_reserve(params.n_seq_max) < params.n_seq_max) {
                 throw std::runtime_error("failed to reserve initial output buffer");
             }
@@ -528,7 +537,7 @@ llama_context::llama_context(
             /*.swa_full  =*/ params.swa_full,
             /*.ctx_type  =*/ cparams.ctx_type,
             /*.mem_other =*/ llama_get_memory(cparams.ctx_other),
-            /*.no_alloc  =*/ model.no_alloc(),
+            /*.no_alloc  =*/ no_alloc(),
         };
 
         memory.reset(model.create_memory(params_mem, cparams));
@@ -599,7 +608,7 @@ llama_context::llama_context(
         }
 
         if (cparams.moe_cache_size > 0) {
-            moe_cache = std::make_unique<llama_moe_cache>(model, model.no_alloc(), backend_ptrs, backend_buft, cparams.moe_cache_size, cparams.moe_cache_cpu_share);
+            moe_cache = std::make_unique<llama_moe_cache>(model, no_alloc(), backend_ptrs, backend_buft, cparams.moe_cache_size, cparams.moe_cache_cpu_share);
         }
 
         sched_reserve();
@@ -624,10 +633,12 @@ llama_context::llama_context(
 
 llama_context::~llama_context() {
     // wait for any pending asynchronous copies into the output buffers before they are freed
-    synchronize();
+    if (init_mode != llama_context_init_mode::DISCOVER) {
+        synchronize();
+    }
 
     // when training, ggml_opt allocates extra buffers through the scheduler, so the sizes no longer match the expectation
-    if (!model.no_alloc() && !opt_ctx) {
+    if (!no_alloc() && !opt_ctx) {
         for (size_t i = 0; i < backend_ptrs.size(); ++i) {
             ggml_backend_t             backend = backend_ptrs[i];
             ggml_backend_buffer_type_t buft    = backend_buft[i];
@@ -786,24 +797,14 @@ void llama_context::sched_reserve() {
 
     LLAMA_LOG_INFO("%s: reserving ...\n", __func__);
 
-    synchronize();
+    if (init_mode != llama_context_init_mode::DISCOVER) {
+        synchronize();
+    }
 
     const int64_t t_start_us = ggml_time_us();
     if (const char * value = getenv("GGML_CUDA_NVRTC_VERBOSE")) {
         if (value[0] != '0') {
             LLAMA_LOG_INFO("NVRTC: graph preparation begins at %.3f s\n", t_start_us/1e6);
-        }
-    }
-
-    if (!model.no_alloc()) {
-        for (auto & backend : backends) {
-            auto * dev = ggml_backend_get_device(backend.get());
-            auto * reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
-            using prepare_begin_fn = void (*)(ggml_backend_t);
-            auto begin = reg ? (prepare_begin_fn) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_prepare_begin") : nullptr;
-            if (begin) {
-                begin(backend.get());
-            }
         }
     }
 
@@ -822,7 +823,7 @@ void llama_context::sched_reserve() {
 
     sched_new({
         /*.max_nodes  =*/ max_nodes,
-        /*.parallel   =*/ cparams.pipeline_parallel,
+        /*.parallel   =*/ cparams.pipeline_parallel && init_mode != llama_context_init_mode::DISCOVER,
         /*.op_offload =*/ cparams.op_offload,
     });
 
@@ -842,6 +843,30 @@ void llama_context::sched_reserve() {
 
     resolve_fused_ops(mctx.get(), n_seqs);
 
+    bool prepare_enabled = false;
+    if (init_mode != llama_context_init_mode::MEASURE) {
+        for (auto & backend : backends) {
+            auto * dev = ggml_backend_get_device(backend.get());
+            auto * reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
+            using prepare_begin_fn = void (*)(ggml_backend_t);
+            auto begin = reg ? (prepare_begin_fn) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_prepare_begin") : nullptr;
+            if (begin) {
+                begin(backend.get());
+                prepare_enabled = true;
+            }
+        }
+    }
+
+    if (prepare_enabled && llama_model_has_encoder(&model) && llama_model_has_decoder(&model)) {
+        const bool causal_attn = cparams.causal_attn;
+        cparams.causal_attn = false;
+        auto * gf = graph_reserve(n_tokens, 1, n_tokens, nullptr, true, nullptr, LLM_GRAPH_TYPE_ENCODER);
+        cparams.causal_attn = causal_attn;
+        if (!gf) {
+            throw std::runtime_error("failed to prepare encoder graph");
+        }
+    }
+
     // reserve worst-case graph
     int n_splits_pp        = -1;
     int n_nodes_pp         = -1;
@@ -858,7 +883,7 @@ void llama_context::sched_reserve() {
     // reserve pp (prompt processing) graph first so that buffers are only allocated once
     {
         auto * gf = graph_reserve(n_tokens, n_seqs, n_outputs_pp, mctx.get(),
-                model.no_alloc(), model.no_alloc() ? backend_buf_exp_size.data() : nullptr);
+                no_alloc(), init_mode == llama_context_init_mode::MEASURE ? backend_buf_exp_size.data() : nullptr);
         if (!gf) {
             if (cparams.pipeline_parallel) {
                 LLAMA_LOG_WARN("%s: compute buffer allocation failed, retrying without pipeline parallelism\n", __func__);
@@ -889,7 +914,7 @@ void llama_context::sched_reserve() {
         n_splits_tg = n_splits_pp;
         n_nodes_tg  = n_nodes_pp;
     } else {
-        auto * gf = graph_reserve(n_seqs, n_seqs, n_seqs, mctx.get(), model.no_alloc());
+        auto * gf = graph_reserve(n_seqs, n_seqs, n_seqs, mctx.get(), no_alloc());
         if (!gf) {
             throw std::runtime_error("failed to allocate compute tg buffers");
         }
@@ -911,10 +936,10 @@ void llama_context::sched_reserve() {
                 // [TAG_RESERVE_DIAG_DECAY]
                 // the `inp_diag_decay` tensor size scales with `n_seq_tokens^2` which
                 // makes `n_seqs == 1` use more memory for the compute graph compared to `n_seqs > 1`
-                gf = graph_reserve(n_tokens, 1,      n_outputs_pp, mctx.get(), model.no_alloc());
+                gf = graph_reserve(n_tokens, 1,      n_outputs_pp, mctx.get(), no_alloc());
                 break;
             default:
-                gf = graph_reserve(n_tokens, n_seqs, n_outputs_pp, mctx.get(), model.no_alloc());
+                gf = graph_reserve(n_tokens, n_seqs, n_outputs_pp, mctx.get(), no_alloc());
         };
 
         if (!gf) {
@@ -925,7 +950,7 @@ void llama_context::sched_reserve() {
     for (size_t i = 0; i < backend_ptrs.size(); ++i) {
         ggml_backend_t             backend = backend_ptrs[i];
         ggml_backend_buffer_type_t buft    = backend_buft[i];
-        if (!model.no_alloc()) {
+        if (!no_alloc()) {
             backend_buf_exp_size[i] = ggml_backend_sched_get_buffer_size(sched.get(), backend);
         }
         if (backend_buf_exp_size[i] > 1) {
@@ -952,16 +977,18 @@ void llama_context::sched_reserve() {
                 val(n_input_tensors_pp, n_input_tensors_tg).c_str());
     }
 
-    if (!model.no_alloc()) {
+    if (init_mode != llama_context_init_mode::MEASURE) {
         for (auto & backend : backends) {
             ggml_backend_dev_t dev = ggml_backend_get_device(backend.get());
             ggml_backend_reg_t reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
             if (!reg) {
                 continue;
             }
-            using prepare_wait_fn = bool (*)(ggml_backend_t);
-            auto prepare_wait = (prepare_wait_fn) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_prepare_wait");
-            if (prepare_wait && !prepare_wait(backend.get())) {
+            const char * name = init_mode == llama_context_init_mode::DISCOVER ?
+                "ggml_backend_cuda_prepare_submit" : "ggml_backend_cuda_prepare_wait";
+            using prepare_fn = bool (*)(ggml_backend_t);
+            auto prepare = (prepare_fn) ggml_backend_reg_get_proc_address(reg, name);
+            if (prepare && !prepare(backend.get())) {
                 throw std::runtime_error(format("failed to prepare kernels for %s", ggml_backend_name(backend.get())));
             }
         }
@@ -3044,7 +3071,7 @@ static void ubatch_prepare_reserve(
 }
 
 ggml_cgraph * llama_context::graph_reserve(
-        uint32_t n_tokens, uint32_t n_seqs, uint32_t n_outputs, const llama_memory_context_i * mctx, bool split_only, size_t * sizes) {
+        uint32_t n_tokens, uint32_t n_seqs, uint32_t n_outputs, const llama_memory_context_i * mctx, bool split_only, size_t * sizes, llm_graph_type gtype) {
     LLAMA_LOG_DEBUG("%s: reserving a graph for ubatch with n_tokens = %4u, n_seqs = %2u, n_outputs = %4u\n", __func__, n_tokens, n_seqs, n_outputs);
     GGML_ASSERT(n_outputs >= 1);
 
@@ -3076,7 +3103,7 @@ ggml_cgraph * llama_context::graph_reserve(
 
     auto * res = gf_res_reserve.get();
 
-    const auto gparams = graph_params(res, ubatch, mctx, ctx_type_to_graph_type(cparams.ctx_type));
+    const auto gparams = graph_params(res, ubatch, mctx, gtype == LLM_GRAPH_TYPE_DEFAULT ? ctx_type_to_graph_type(cparams.ctx_type) : gtype);
 
     res->reset();
 
@@ -4188,7 +4215,7 @@ llama_memory_breakdown llama_context::memory_breakdown() const {
             ret[buft].context += size;
         }
     }
-    if (model.no_alloc()) {
+    if (no_alloc()) {
         for (size_t i = 0; i < backends.size(); ++i) {
             ggml_backend_t             backend = backends[i].get();
             ggml_backend_buffer_type_t buft    = ggml_backend_sched_get_buffer_type(sched.get(), backend);
@@ -4495,22 +4522,20 @@ llama_context_params llama_context_default_params() {
     return result;
 }
 
-llama_context * llama_init_from_model(
-                 llama_model * model,
-        llama_context_params   params) {
+static bool llama_context_params_normalize(llama_model * model, llama_context_params & params) {
     if (!model) {
         LLAMA_LOG_ERROR("%s: model cannot be NULL\n", __func__);
-        return nullptr;
+        return false;
     }
 
     if (params.n_batch == 0 && params.n_ubatch == 0) {
         LLAMA_LOG_ERROR("%s: n_batch and n_ubatch cannot both be zero\n", __func__);
-        return nullptr;
+        return false;
     }
 
     if (params.n_ctx == 0 && model->hparams.n_ctx_train == 0) {
         LLAMA_LOG_ERROR("%s: n_ctx and model->hparams.n_ctx_train cannot both be zero\n", __func__);
-        return nullptr;
+        return false;
     }
 
     if (params.flash_attn_type != LLAMA_FLASH_ATTN_TYPE_DISABLED && model->arch == LLM_ARCH_GROK) {
@@ -4525,7 +4550,7 @@ llama_context * llama_init_from_model(
         }
         if (params.flash_attn_type != LLAMA_FLASH_ATTN_TYPE_ENABLED) {
             LLAMA_LOG_ERROR("%s: SPLIT_MODE_TENSOR requires flash_attn to be enabled\n", __func__);
-            return nullptr;
+            return false;
         }
         if (model->get_split_state_ud.n_devices == 1) {
             LLAMA_LOG_WARN("%s: SPLIT_MODE_TENSOR being used for a single device is not recommended\n", __func__);
@@ -4534,7 +4559,7 @@ llama_context * llama_init_from_model(
 
     if ((model->hparams.is_mla() || model->arch == LLM_ARCH_DEEPSEEK4 || model->arch == LLM_ARCH_DEEPSEEK41) && params.type_k != params.type_v) {
         LLAMA_LOG_ERROR("%s: model does not support different K (%s) and V (%s) cache types\n", __func__, ggml_type_name(params.type_k), ggml_type_name(params.type_v));
-        return nullptr;
+        return false;
     }
 
     const bool fp8_cache = params.type_k == GGML_TYPE_F8_E4M3 || params.type_v == GGML_TYPE_F8_E4M3;
@@ -4552,7 +4577,7 @@ llama_context * llama_init_from_model(
             model->arch == LLM_ARCH_QWEN4EXP ||
             model->arch == LLM_ARCH_DFLASH)) {
         LLAMA_LOG_ERROR("%s: FP8 cache is not supported for architecture '%s'\n", __func__, llm_arch_name(model->arch));
-        return nullptr;
+        return false;
     }
 
     if (fp8_cache) {
@@ -4570,7 +4595,7 @@ llama_context * llama_init_from_model(
                 ggml_backend_tensor_get(scale, &value, 0, sizeof(value));
                 if (!std::isfinite(value) || value == 0.0f) {
                     LLAMA_LOG_ERROR("%s: FP8 cache scale '%s' must be finite and nonzero\n", __func__, ggml_get_name(scale));
-                    return nullptr;
+                    return false;
                 }
             }
         }
@@ -4583,7 +4608,7 @@ llama_context * llama_init_from_model(
         }
         if (params.flash_attn_type == LLAMA_FLASH_ATTN_TYPE_DISABLED) {
             LLAMA_LOG_ERROR("%s: quantized V cache requires flash_attn to be enabled\n", __func__);
-            return nullptr;
+            return false;
         }
     }
 
@@ -4593,7 +4618,7 @@ llama_context * llama_init_from_model(
             if (model->hparams.n_embd_head_k(il) % blck_size != 0) {
                 LLAMA_LOG_ERROR("%s: K cache type %s with block size %u does not divide n_embd_head_k=%u\n",
                     __func__, ggml_type_name(params.type_k), blck_size, model->hparams.n_embd_head_k(il));
-                return nullptr;
+                return false;
             }
         }
     }
@@ -4604,7 +4629,7 @@ llama_context * llama_init_from_model(
             if (model->hparams.n_embd_head_v(il) % blck_size != 0) {
                 LLAMA_LOG_ERROR("%s: V cache type %s with block size %u does not divide n_embd_head_v=%u\n",
                     __func__, ggml_type_name(params.type_v), blck_size, model->hparams.n_embd_head_v(il));
-                return nullptr;
+                return false;
             }
         }
     }
@@ -4620,6 +4645,56 @@ llama_context * llama_init_from_model(
     if (params.ctx_type == LLAMA_CONTEXT_TYPE_MTP &&
         (model->hparams.n_layer_nextn == 0 || model->hparams.router_layer >= 0)) {
         LLAMA_LOG_WARN("%s: context type MTP requested but model doesn't contain MTP layers\n", __func__);
+        return false;
+    }
+
+    return true;
+}
+
+bool llama_prepare_kernels(llama_model & model, llama_context_params params) {
+    const char * deferred = nullptr;
+    if (model.no_alloc()) {
+        deferred = "memory measurement";
+    } else if (params.ctx_other) {
+        deferred = "external context";
+    } else if (params.samplers && params.n_samplers > 0) {
+        deferred = "backend samplers";
+    } else if (params.cb_eval) {
+        deferred = "evaluation callback";
+    }
+    if (deferred) {
+        LLAMA_LOG_INFO("%s: early kernel preparation deferred: %s\n", __func__, deferred);
+        return false;
+    }
+    if (!llama_context_params_normalize(&model, params)) {
+        throw std::runtime_error("invalid context parameters for early kernel preparation");
+    }
+    const char * nvrtc_verbose = getenv("GGML_CUDA_NVRTC_VERBOSE");
+    const bool verbose = nvrtc_verbose && nvrtc_verbose[0] != '0';
+    const int64_t t_start_us = ggml_time_us();
+    if (verbose) {
+        LLAMA_LOG_INFO("NVRTC: metadata graph discovery begins at %.3f s\n", t_start_us / 1e6);
+    }
+    try {
+        {
+            llama_context ctx(model, params, llama_context_init_mode::DISCOVER);
+        }
+        if (verbose) {
+            const int64_t t_end_us = ggml_time_us();
+            LLAMA_LOG_INFO("NVRTC: metadata graph discovery ends at %.3f s (%.1f ms, compilation submitted asynchronously)\n",
+                    t_end_us / 1e6, (t_end_us - t_start_us) / 1000.0);
+        }
+        return true;
+    } catch (const llama_context_dependency_error & err) {
+        LLAMA_LOG_INFO("%s: early kernel preparation deferred: %s\n", __func__, err.what());
+        return false;
+    }
+}
+
+llama_context * llama_init_from_model(
+        llama_model * model,
+        llama_context_params params) {
+    if (!llama_context_params_normalize(model, params)) {
         return nullptr;
     }
 

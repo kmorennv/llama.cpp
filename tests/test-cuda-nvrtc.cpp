@@ -100,25 +100,69 @@ static ggml_tensor * build_auxiliary_graph(ggml_context * ctx, bool attention, i
     return output;
 }
 
+static bool prepare_graph(ggml_backend_t backend, ggml_backend_t reference, ggml_context * ctx, ggml_tensor * output, bool static_weight = false) {
+    ggml_backend_buffer_ptr weights;
+    if (static_weight) {
+        weights.reset(ggml_backend_buft_alloc_buffer(ggml_backend_get_default_buffer_type(backend), 0));
+        if (!weights) {
+            return false;
+        }
+        ggml_backend_buffer_set_usage(weights.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+        output->src[0]->buffer = weights.get();
+    }
+    ggml_cgraph * graph = ggml_new_graph(ctx);
+    ggml_build_forward_expand(graph, output);
+    ggml_backend_t backends[] = { backend, reference };
+    ggml_backend_sched_ptr scheduler(ggml_backend_sched_new(backends, nullptr, 2, GGML_DEFAULT_GRAPH_SIZE, false, true));
+    if (!scheduler || !ggml_backend_supports_op(backend, output)) {
+        if (static_weight) {
+            output->src[0]->buffer = nullptr;
+        }
+        return false;
+    }
+    ggml_backend_sched_set_tensor_backend(scheduler.get(), output, backend);
+    ggml_backend_sched_split_graph(scheduler.get(), graph);
+    const bool no_allocation = ggml_backend_sched_get_buffer_size(scheduler.get(), backend) == 0;
+    scheduler.reset();
+    if (static_weight) {
+        output->src[0]->buffer = nullptr;
+    }
+    return no_allocation;
+}
+
+static bool prepare_quant_graphs(ggml_backend_t backend, ggml_backend_t reference, const std::vector<ggml_type> & types) {
+    for (ggml_type type : types) {
+        for (int64_t rows : { 128, 130 }) {
+            for (bool moe : { false, true }) {
+                if (moe && (type != GGML_TYPE_Q4_K || rows != 128)) {
+                    continue;
+                }
+                const ggml_init_params params = { ggml_tensor_overhead()*8 + ggml_graph_overhead(), nullptr, true };
+                ggml_context_ptr ctx(ggml_init(params));
+                if (!ctx) {
+                    return false;
+                }
+                ggml_tensor * weights = ggml_new_tensor_3d(ctx.get(), type, 256, rows, moe ? 3 : 1);
+                ggml_tensor * input = moe ? ggml_new_tensor_3d(ctx.get(), GGML_TYPE_F32, 256, 2, 7) :
+                    ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F32, 256, 32);
+                ggml_tensor * ids = moe ? ggml_new_tensor_2d(ctx.get(), GGML_TYPE_I32, 2, 7) : nullptr;
+                ggml_tensor * output = moe ? ggml_mul_mat_id(ctx.get(), weights, input, ids) : ggml_mul_mat(ctx.get(), weights, input);
+                if (!prepare_graph(backend, reference, ctx.get(), output, true)) {
+                    return false;
+                }
+            }
+        }
+    }
+    return true;
+}
+
 static bool prepare_auxiliary_graphs(ggml_backend_t backend, ggml_backend_t reference) {
     for (int variant = 0; variant < 3; ++variant) {
         const bool attention = variant != 0;
         const bool softcap = variant == 2;
         const ggml_init_params params = { ggml_tensor_overhead()*8 + ggml_graph_overhead(), nullptr, true };
         ggml_context_ptr ctx(ggml_init(params));
-        if (!ctx) {
-            return false;
-        }
-        ggml_tensor * output = build_auxiliary_graph(ctx.get(), attention, 16, softcap);
-        ggml_cgraph * graph = ggml_new_graph(ctx.get());
-        ggml_build_forward_expand(graph, output);
-        ggml_backend_t backends[] = { backend, reference };
-        ggml_backend_sched_ptr scheduler(ggml_backend_sched_new(backends, nullptr, 2, GGML_DEFAULT_GRAPH_SIZE, false, true));
-        if (!scheduler) {
-            return false;
-        }
-        ggml_backend_sched_set_tensor_backend(scheduler.get(), output, backend);
-        if (!ggml_backend_sched_reserve(scheduler.get(), graph)) {
+        if (!ctx || !prepare_graph(backend, reference, ctx.get(), build_auxiliary_graph(ctx.get(), attention, 16, softcap))) {
             return false;
         }
     }
@@ -130,19 +174,14 @@ static bool prepare_float_graphs(ggml_backend_t backend, ggml_backend_t referenc
         for (bool moe : { false, true }) {
             const ggml_init_params params = { ggml_tensor_overhead()*8 + ggml_graph_overhead(), nullptr, true };
             ggml_context_ptr ctx(ggml_init(params));
+            if (!ctx) {
+                return false;
+            }
             ggml_tensor * weights = ggml_new_tensor_3d(ctx.get(), type, 512, 130, moe ? 3 : 1);
             ggml_tensor * input = ggml_new_tensor_3d(ctx.get(), GGML_TYPE_F32, 512, moe ? 2 : 8, moe ? 7 : 1);
             ggml_tensor * ids = moe ? ggml_new_tensor_2d(ctx.get(), GGML_TYPE_I32, 2, 7) : nullptr;
             ggml_tensor * output = moe ? ggml_mul_mat_id(ctx.get(), weights, input, ids) : ggml_mul_mat(ctx.get(), weights, input);
-            ggml_cgraph * graph = ggml_new_graph(ctx.get());
-            ggml_build_forward_expand(graph, output);
-            ggml_backend_t backends[] = { backend, reference };
-            ggml_backend_sched_ptr scheduler(ggml_backend_sched_new(backends, nullptr, 2, GGML_DEFAULT_GRAPH_SIZE, false, true));
-            if (!scheduler) {
-                return false;
-            }
-            ggml_backend_sched_set_tensor_backend(scheduler.get(), output, backend);
-            if (!ggml_backend_sched_reserve(scheduler.get(), graph)) {
+            if (!prepare_graph(backend, reference, ctx.get(), output)) {
                 return false;
             }
         }
@@ -189,6 +228,29 @@ static bool run_auxiliary_case(ggml_backend_t backend, ggml_backend_t reference,
     return ok;
 }
 
+static bool reject_unprepared_graph(ggml_backend_t backend) {
+    const ggml_init_params params = { ggml_tensor_overhead()*4 + ggml_graph_overhead(), nullptr, true };
+    ggml_context_ptr ctx(ggml_init(params));
+    if (!ctx) {
+        return false;
+    }
+    ggml_tensor * weights = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_Q2_K, 256, 128);
+    ggml_tensor * input = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F32, 256, 1);
+    ggml_tensor * output = ggml_mul_mat(ctx.get(), weights, input);
+    ggml_cgraph * graph = ggml_new_graph(ctx.get());
+    ggml_build_forward_expand(graph, output);
+    ggml_backend_buffer_ptr buffer(ggml_backend_alloc_ctx_tensors(ctx.get(), backend));
+    if (!buffer) {
+        return false;
+    }
+    ggml_backend_buffer_clear(buffer.get(), 0);
+    const bool rejected = ggml_backend_graph_compute(backend, graph) == GGML_STATUS_FAILED;
+    if (!rejected) {
+        fprintf(stderr, "NVRTC accepted a kernel submitted without a readiness barrier\n");
+    }
+    return rejected;
+}
+
 int main() {
     ggml_backend_load_all();
     ggml_backend_dev_t device = ggml_backend_dev_by_name("CUDA0");
@@ -197,71 +259,66 @@ int main() {
         return 77;
     }
     ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(device);
-    using prepare_tensor_fn = bool (*)(ggml_backend_dev_t, const ggml_tensor *);
-    using prepare_fattn_fn = bool (*)(ggml_backend_dev_t, int, int, bool);
+    using prepare_submit_fn = bool (*)(ggml_backend_t);
     using prepare_wait_fn = bool (*)(ggml_backend_t);
     using prepare_begin_fn = void (*)(ggml_backend_t);
     using compilation_count_fn = uint64_t (*)();
-    auto prepare_tensor = (prepare_tensor_fn) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_prepare_tensor");
-    auto prepare_fattn = (prepare_fattn_fn) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_prepare_fattn");
+    auto prepare_submit = (prepare_submit_fn) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_prepare_submit");
     auto prepare_wait = (prepare_wait_fn) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_prepare_wait");
     auto prepare_begin = (prepare_begin_fn) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_prepare_begin");
     auto compilation_count = (compilation_count_fn) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_nvrtc_compilation_count");
-    if (!prepare_tensor || !prepare_fattn || !prepare_wait || !prepare_begin || !compilation_count) {
+    if (!prepare_submit || !prepare_wait || !prepare_begin || !compilation_count) {
         printf("NVRTC test skipped: CUDA backend has no preparation hooks\n");
         return 77;
     }
 
     try {
-        const ggml_type quant_types[] = {
+        const std::vector<ggml_type> quant_types = {
             GGML_TYPE_Q3_K, GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K,
             GGML_TYPE_Q8_0, GGML_TYPE_IQ4_XS, GGML_TYPE_IQ4_NL, GGML_TYPE_IQ3_S,
         };
         ggml_backend_ptr backend(ggml_backend_dev_init(device, nullptr));
         ggml_backend_ptr reference(ggml_backend_init_by_name("CPU", nullptr));
-        const ggml_init_params params = { ggml_tensor_overhead()*17, nullptr, true };
-        ggml_context_ptr metadata(ggml_init(params));
-        if (!backend || !reference || !metadata) {
+        if (!backend || !reference) {
             return 1;
         }
-        prepare_begin(backend.get());
-        for (bool softcap : { false, true }) {
-            const int head_size = softcap ? 128 : 64;
-            if (!prepare_fattn(device, head_size, head_size, softcap)) {
+        {
+            ggml_backend_ptr discovery(ggml_backend_dev_init(device, nullptr));
+            if (!discovery) {
+                return 1;
+            }
+            const uint64_t before_discovery = compilation_count();
+            prepare_begin(discovery.get());
+            if (!prepare_auxiliary_graphs(discovery.get(), reference.get()) ||
+                    !prepare_quant_graphs(discovery.get(), reference.get(), quant_types) ||
+                    !prepare_float_graphs(discovery.get(), reference.get())) {
+                return 1;
+            }
+            if (compilation_count() != before_discovery) {
+                fprintf(stderr, "NVRTC compiled during requirement collection\n");
+                return 1;
+            }
+            if (!prepare_submit(discovery.get())) {
                 return 1;
             }
         }
-        for (ggml_type type : quant_types) {
-            for (int64_t rows : { 128, 130 }) {
-                const ggml_tensor * weights = ggml_new_tensor_2d(metadata.get(), type, 256, rows);
-                if (!prepare_tensor(device, weights)) {
-                    return 1;
-                }
-            }
-        }
-        const ggml_tensor * experts = ggml_new_tensor_3d(metadata.get(), GGML_TYPE_Q4_K, 256, 128, 3);
-        if (!prepare_tensor(device, experts)) {
-            return 1;
-        }
-        if (!prepare_auxiliary_graphs(backend.get(), reference.get()) || !prepare_float_graphs(backend.get(), reference.get())) {
-            return 1;
-        }
-        if (!prepare_wait(backend.get())) {
+        prepare_begin(backend.get());
+        if (!prepare_auxiliary_graphs(backend.get(), reference.get()) ||
+                !prepare_quant_graphs(backend.get(), reference.get(), quant_types) ||
+                !prepare_float_graphs(backend.get(), reference.get()) || !prepare_wait(backend.get())) {
             return 1;
         }
         const uint64_t prepared_compilations = compilation_count();
         prepare_begin(backend.get());
-        for (bool softcap : { false, true }) {
-            const int head_size = softcap ? 128 : 64;
-            if (!prepare_fattn(device, head_size, head_size, softcap)) {
-                return 1;
-            }
+        if (!prepare_auxiliary_graphs(backend.get(), reference.get()) || !prepare_submit(backend.get())) {
+            return 1;
         }
+        prepare_begin(backend.get());
         if (!prepare_auxiliary_graphs(backend.get(), reference.get()) || !prepare_wait(backend.get())) {
             return 1;
         }
         if (compilation_count() != prepared_compilations) {
-            fprintf(stderr, "NVRTC recompiled a prepared attention specialization\n");
+            fprintf(stderr, "NVRTC recompiled a prepared graph specialization\n");
             return 1;
         }
 
@@ -313,6 +370,25 @@ int main() {
             fprintf(stderr, "NVRTC compiled a kernel after the preparation barrier\n");
             return 1;
         }
+        {
+            ggml_backend_ptr discovery(ggml_backend_dev_init(device, nullptr));
+            if (!discovery) {
+                return 1;
+            }
+            prepare_begin(discovery.get());
+            if (!prepare_quant_graphs(discovery.get(), reference.get(), { GGML_TYPE_Q2_K }) || !prepare_submit(discovery.get())) {
+                return 1;
+            }
+        }
+        if (!reject_unprepared_graph(backend.get()) || !run_case(backend.get(), reference.get(), GGML_TYPE_Q4_K, 128, 1)) {
+            return 1;
+        }
+        prepare_begin(backend.get());
+        if (!prepare_quant_graphs(backend.get(), reference.get(), { GGML_TYPE_Q2_K }) || !prepare_wait(backend.get()) ||
+                !run_case(backend.get(), reference.get(), GGML_TYPE_Q2_K, 128, 1)) {
+            return 1;
+        }
+
     } catch (const std::exception & error) {
         fprintf(stderr, "NVRTC preparation test failed: %s\n", error.what());
         return 1;

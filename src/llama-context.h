@@ -42,11 +42,21 @@ struct llama_memory_buffer {
 
 using llama_memory_buffers = std::map<ggml_backend_buffer_type_t, llama_memory_buffer>;
 
+enum class llama_context_init_mode {
+    REAL,
+    MEASURE,
+    DISCOVER,
+};
+
+// Submit kernel preparation without tensor data. Return false if context dependencies require deferral.
+bool llama_prepare_kernels(llama_model & model, llama_context_params params);
+
 struct llama_context {
     // init scheduler and compute buffers, reserve worst-case graphs
     llama_context(
             const llama_model & model,
-                  llama_context_params params);
+            llama_context_params params,
+            llama_context_init_mode mode = llama_context_init_mode::REAL);
 
     ~llama_context();
 
@@ -282,11 +292,14 @@ public:
 
     // reserve a graph with a dummy ubatch of the specified size
     ggml_cgraph * graph_reserve(
-        uint32_t n_tokens, uint32_t n_seqs, uint32_t n_outputs, const llama_memory_context_i * mctx, bool split_only = false, size_t * sizes = nullptr);
+        uint32_t n_tokens, uint32_t n_seqs, uint32_t n_outputs, const llama_memory_context_i * mctx, bool split_only = false, size_t * sizes = nullptr,
+        llm_graph_type gtype = LLM_GRAPH_TYPE_DEFAULT);
 
     bool set_sampler(llama_seq_id seq_id, llama_sampler * sampler);
 
 private:
+    bool no_alloc() const { return init_mode != llama_context_init_mode::REAL; }
+
     llm_graph_result * get_gf_res_prev();
 
     llm_graph_params graph_params(
@@ -336,6 +349,7 @@ private:
     //
 
     const llama_model & model;
+    const llama_context_init_mode init_mode;
 
     llama_cparams cparams;
 

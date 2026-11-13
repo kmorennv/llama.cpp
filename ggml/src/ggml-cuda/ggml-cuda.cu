@@ -5471,22 +5471,25 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
 
 #ifdef GGML_CUDA_NVRTC
-    for (int i = 0; cuda_ctx->nvrtc_preparing && i < cgraph->n_nodes; ++i) {
-        const ggml_tensor * node = cgraph->nodes[i];
-        const ggml_tensor * weight = node->src[0];
-        if (!weight) {
-            continue;
-        }
-        if (node->op == GGML_OP_MUL_MAT || node->op == GGML_OP_MUL_MAT_ID) {
-            if (ggml_is_quantized(weight->type)) {
-                ggml_cuda_nvrtc_mmq_prepare(cuda_ctx->device, weight->type, weight->ne[0], weight->ne[1]);
-                ggml_cuda_nvrtc_mmvq_prepare(cuda_ctx->device, weight->type, weight->ne[0], node->op == GGML_OP_MUL_MAT_ID);
-            } else {
-                ggml_cuda_nvrtc_mmf_prepare(cuda_ctx->device, node);
-                ggml_cuda_nvrtc_mmvf_prepare(cuda_ctx->device, weight, node->op == GGML_OP_MUL_MAT_ID);
+    if (cuda_ctx->nvrtc_preparing) {
+        ggml_cuda_nvrtc_collection collection(*cuda_ctx->nvrtc_plan);
+        for (int i = 0; i < cgraph->n_nodes; ++i) {
+            const ggml_tensor * node = cgraph->nodes[i];
+            const ggml_tensor * weight = node->src[0];
+            if (!weight) {
+                continue;
             }
-        } else if (node->op == GGML_OP_FLASH_ATTN_EXT) {
-            ggml_cuda_nvrtc_fattn_prepare(cuda_ctx->device, node);
+            if (node->op == GGML_OP_MUL_MAT || node->op == GGML_OP_MUL_MAT_ID) {
+                if (ggml_is_quantized(weight->type)) {
+                    ggml_cuda_nvrtc_mmq_prepare(cuda_ctx->device, weight->type, weight->ne[0], weight->ne[1]);
+                    ggml_cuda_nvrtc_mmvq_prepare(cuda_ctx->device, weight->type, weight->ne[0], node->op == GGML_OP_MUL_MAT_ID);
+                } else {
+                    ggml_cuda_nvrtc_mmf_prepare(cuda_ctx->device, node);
+                    ggml_cuda_nvrtc_mmvf_prepare(cuda_ctx->device, weight, node->op == GGML_OP_MUL_MAT_ID);
+                }
+            } else if (node->op == GGML_OP_FLASH_ATTN_EXT) {
+                ggml_cuda_nvrtc_fattn_prepare(cuda_ctx->device, node);
+            }
         }
     }
 #endif
@@ -6849,20 +6852,6 @@ static bool ggml_cuda_nvrtc_aot_arch_supported(int device) {
     return false;
 }
 
-static bool ggml_backend_cuda_prepare_fattn(ggml_backend_dev_t dev, int DKQ, int DV, bool use_softcap) {
-    try {
-        auto * ctx = (ggml_backend_cuda_device_context *) dev->context;
-        if (!ggml_cuda_nvrtc_aot_arch_supported(ctx->device)) {
-            return false;
-        }
-        ggml_cuda_nvrtc_fattn_prepare_mma(ctx->device, DKQ, DV, use_softcap);
-        return true;
-    } catch (const std::exception & error) {
-        GGML_LOG_ERROR("NVRTC FlashAttention preparation failed on %s: %s\n", ggml_backend_dev_name(dev), error.what());
-        return false;
-    }
-}
-
 static bool ggml_backend_cuda_prepare_tensor(ggml_backend_dev_t dev, const ggml_tensor * tensor) {
     try {
         auto * ctx = (ggml_backend_cuda_device_context *) dev->context;
@@ -6882,15 +6871,35 @@ static bool ggml_backend_cuda_prepare_tensor(ggml_backend_dev_t dev, const ggml_
     }
 }
 
+static bool ggml_backend_cuda_prepare_submit(ggml_backend_t backend) {
+    auto * ctx = (ggml_backend_cuda_context *) backend->context;
+    if (!ctx->nvrtc_plan) {
+        return false;
+    }
+    ctx->nvrtc_preparing = false;
+    try {
+        if (!ggml_cuda_nvrtc_aot_arch_supported(ctx->device)) {
+            return false;
+        }
+        ggml_cuda_nvrtc_submit(*ctx->nvrtc_plan);
+        return true;
+    } catch (const std::exception & error) {
+        GGML_LOG_ERROR("NVRTC submission failed on %s: %s\n", ctx->name.c_str(), error.what());
+        return false;
+    }
+}
+
 static bool ggml_backend_cuda_prepare_wait(ggml_backend_t backend) {
     auto * ctx = (ggml_backend_cuda_context *) backend->context;
-    const bool result = ggml_cuda_nvrtc_wait(ctx->device);
-    ctx->nvrtc_preparing = false;
-    return result;
+    if (!ggml_backend_cuda_prepare_submit(backend)) {
+        return false;
+    }
+    return ggml_cuda_nvrtc_wait(*ctx->nvrtc_plan);
 }
 
 static void ggml_backend_cuda_prepare_begin(ggml_backend_t backend) {
     auto * ctx = (ggml_backend_cuda_context *) backend->context;
+    ctx->nvrtc_plan.reset(new ggml_cuda_nvrtc_plan(ctx->device));
     ctx->nvrtc_preparing = true;
 }
 #endif
@@ -6904,14 +6913,14 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     if (strcmp(name, "ggml_backend_cuda_nvrtc_cache_hit_count") == 0) {
         return (void *) ggml_cuda_nvrtc_cache_hit_count;
     }
-    if (strcmp(name, "ggml_backend_cuda_prepare_fattn") == 0) {
-        return (void *) ggml_backend_cuda_prepare_fattn;
-    }
     if (strcmp(name, "ggml_backend_cuda_prepare_tensor") == 0) {
         return (void *) ggml_backend_cuda_prepare_tensor;
     }
     if (strcmp(name, "ggml_backend_cuda_prepare_wait") == 0) {
         return (void *) ggml_backend_cuda_prepare_wait;
+    }
+    if (strcmp(name, "ggml_backend_cuda_prepare_submit") == 0) {
+        return (void *) ggml_backend_cuda_prepare_submit;
     }
     if (strcmp(name, "ggml_backend_cuda_prepare_begin") == 0) {
         return (void *) ggml_backend_cuda_prepare_begin;

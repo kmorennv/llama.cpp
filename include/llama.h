@@ -350,7 +350,7 @@ extern "C" {
         const struct llama_model_kv_override * kv_overrides;
 
         // Optional context settings for early kernel preparation (NULL = prepare during context creation).
-        // Only compilation settings are copied; the pointer must remain valid until model loading returns.
+        // Settings are copied; the pointer and its referenced objects must remain valid until model loading returns.
         const struct llama_context_params * prepare_context;
 
         // Keep the booleans together to avoid misalignment during copy-by-value.

@@ -6,6 +6,7 @@
 #include "llama-impl.h"
 #include "llama-mmap.h"
 #include "llama-cparams.h"
+#include "llama-context.h"
 #include "llama-model-loader.h"
 
 #include "llama-kv-cache.h"
@@ -37,8 +38,6 @@
 #include <numeric>
 #include <regex>
 #include <sstream>
-#include <set>
-#include <tuple>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -1375,7 +1374,14 @@ struct llama_model::impl {
     std::vector<layer_dev> dev_layer;
 
     bool has_tensor_overrides;
-    bool prepare_flash_attn = false;
+    std::unique_ptr<llama_context_params> prepare_context;
+
+    struct hadamard_tensor {
+        ggml_context_ptr ctx;
+        ggml_backend_buffer_type_t buft;
+        bool rotation;
+    };
+    std::vector<hadamard_tensor> hadamard_tensors;
 
     std::vector<float> tensor_split_owned;
 };
@@ -1432,9 +1438,7 @@ void llama_prec_policy::load(llama_model_loader & ml, const llama_model & model)
 
 llama_model::llama_model(const llama_model_params & params) : params(params), pimpl(std::make_unique<impl>()) {
     if (const auto * context = params.prepare_context) {
-        pimpl->prepare_flash_attn = context->flash_attn_type == LLAMA_FLASH_ATTN_TYPE_ENABLED &&
-            context->offload_kqv && context->op_offload && context->ctx_other == nullptr &&
-            context->ctx_type == LLAMA_CONTEXT_TYPE_DEFAULT;
+        pimpl->prepare_context = std::make_unique<llama_context_params>(*context);
     }
     this->params.prepare_context = nullptr;
     if (params.tensor_split != nullptr) {
@@ -1683,6 +1687,38 @@ void llama_model_base::load_vocab(llama_model_loader & ml) {
 
     vocab.load(ml, kv);
 }
+
+struct llama_model_tensor_bindings {
+    struct binding {
+        ggml_tensor * tensor;
+        ggml_backend_buffer_t buffer;
+        void * data;
+    };
+
+    std::vector<binding> tensors;
+    std::vector<ggml_backend_buffer_ptr> buffers;
+
+    ~llama_model_tensor_bindings() {
+        for (const auto & binding : tensors) {
+            binding.tensor->buffer = binding.buffer;
+            binding.tensor->data = binding.data;
+        }
+    }
+
+    void bind(ggml_context * ctx, ggml_backend_buffer_type_t buft) {
+        ggml_backend_buffer_ptr buffer(ggml_backend_buft_alloc_buffer(buft, 0));
+        if (!buffer) {
+            throw std::runtime_error(format("unable to create %s metadata buffer", ggml_backend_buft_name(buft)));
+        }
+        ggml_backend_buffer_set_usage(buffer.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+        buffers.emplace_back(std::move(buffer));
+        for (auto * t = ggml_get_first_tensor(ctx); t; t = ggml_get_next_tensor(ctx, t)) {
+            tensors.push_back({ t, t->buffer, t->data });
+            t->buffer = buffers.back().get();
+            t->data = nullptr;
+        }
+    }
+};
 
 bool llama_model_base::load_tensors(llama_model_loader & ml) {
     const auto & split_mode   = params.split_mode;
@@ -2007,31 +2043,32 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     // per-tensor activation precision policy
     prec_policy.load(ml, *this);
 
-    // Start the longest attention jobs before the tensor jobs enter the FIFO queue.
-    if (!ml.no_alloc && pimpl->prepare_flash_attn && can_prepare_fattn()) {
-        using prepare_fattn_fn = bool (*)(ggml_backend_dev_t, int, int, bool);
-        std::set<std::tuple<ggml_backend_dev_t, uint32_t, uint32_t>> prepared;
-        for (uint32_t il = 0; il < hparams.n_layer(); ++il) {
-            if (hparams.is_recr(il) || hparams.n_head(il) == 0 || hparams.n_head_kv(il) == 0) {
-                continue;
+    const auto prepare_context = std::move(pimpl->prepare_context);
+    bool can_prepare = false;
+    if (!ml.no_alloc && prepare_context) {
+        for (const auto & dev : devices) {
+            auto * reg = ggml_backend_dev_backend_reg(dev.dev);
+            can_prepare |= ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_prepare_submit") != nullptr;
+        }
+    }
+
+    bool prepared = false;
+    if (can_prepare || !hdmd.weight_blocks.empty() || !hdmd.inverse_blocks.empty()) {
+        llama_model_tensor_bindings bindings;
+        for (const auto & [ctx_key, ctx_ptr] : ml.ctx_map) {
+            bindings.bind(ctx_ptr.get(), ctx_key.buft);
+        }
+        create_tensors_hadamard();
+        if (can_prepare) {
+            for (const auto & tensor : pimpl->hadamard_tensors) {
+                bindings.bind(tensor.ctx.get(), tensor.buft);
             }
-            auto * dev = dev_layer(il);
-            auto * reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
-            auto prepare = reg ? (prepare_fattn_fn) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_prepare_fattn") : nullptr;
-            const uint32_t dkq = hparams.n_embd_head_k(il);
-            const uint32_t dv = hparams.n_embd_head_v(il);
-            if (!prepare || !prepared.emplace(dev, dkq, dv).second) {
-                continue;
-            }
-            const bool softcap = hparams.attn_soft_cap && hparams.f_attn_logit_softcapping != 0.0f;
-            if (!prepare(dev, dkq, dv, softcap)) {
-                throw std::runtime_error(format("failed to prepare attention kernels on %s", ggml_backend_dev_name(dev)));
-            }
+            prepared = llama_prepare_kernels(*this, *prepare_context);
         }
     }
 
     // start compilation before checkpoint prefetch and uploads
-    if (!ml.no_alloc) {
+    if (!ml.no_alloc && !prepared) {
         for (const auto & [ctx_key, ctx_ptr] : ml.ctx_map) {
             if (ggml_backend_buft_is_host(ctx_key.buft)) {
                 continue;
@@ -2192,6 +2229,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     }
 
     if (ml.no_alloc) {
+        load_tensors_hadamard(true);
         return true;
     }
 
@@ -2216,7 +2254,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         }
     }
 
-    load_tensors_hadamard();
+    load_tensors_hadamard(false);
 
     if (log_preparation) {
         LLAMA_LOG_INFO("NVRTC: checkpoint loading ends at %.3f s\n", ggml_time_us()/1e6);
@@ -2225,7 +2263,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     return true;
 }
 
-// read and check the prism.hadamard metadata, and record the folded weights (load_tensors_hadamard makes the tensors)
+// read and check the prism.hadamard metadata, and record the folded weights
 void llama_model_base::load_hparams_hadamard(llama_model_loader & ml) {
     uint32_t hadamard_version = 0;
     ml.get_key(LLM_KV_PRISM_HADAMARD_TIED_OUTPUT, hdmd.tied_output, false);
@@ -2391,7 +2429,7 @@ void llama_model_base::load_hparams_hadamard(llama_model_loader & ml) {
 
 // make one Hadamard matrix per block size and one sign vector per width (the GGUF does not contain them)
 // each tensor goes on the buffer type of its weights (never a CPU extra type), and each transform goes in hdmd.rot or hdmd.inv
-void llama_model_base::load_tensors_hadamard() {
+void llama_model_base::create_tensors_hadamard() {
     if (hdmd.weight_blocks.empty() && hdmd.inverse_blocks.empty()) {
         return;
     }
@@ -2468,30 +2506,7 @@ void llama_model_base::load_tensors_hadamard() {
                 snprintf(rotation_name, sizeof(rotation_name), "prism.hadamard.%u", block_size);
                 ggml_set_name(rotation, rotation_name);
 
-                ggml_backend_buffer_ptr buffer { ggml_backend_alloc_ctx_tensors_from_buft(ctx.get(), buft) };
-                if (!buffer) {
-                    throw std::runtime_error(format("unable to allocate %s Hadamard rotation buffer", ggml_backend_buft_name(buft)));
-                }
-                ggml_backend_buffer_set_usage(buffer.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
-
-                std::vector<float> data((size_t) block_size * block_size);
-                const float scale = 1.0f / sqrtf((float) block_size);
-                for (uint32_t row = 0; row < block_size; ++row) {
-                    for (uint32_t col = 0; col < block_size; ++col) {
-                        uint32_t parity = row & col;
-                        parity ^= parity >> 16;
-                        parity ^= parity >> 8;
-                        parity ^= parity >> 4;
-                        parity ^= parity >> 2;
-                        parity ^= parity >> 1;
-                        data[(size_t) row * block_size + col] = (parity & 1) ? -scale : scale;
-                    }
-                }
-                ggml_backend_tensor_set(rotation, data.data(), 0, data.size() * sizeof(float));
-
-                std::vector<ggml_backend_buffer_ptr> buffers;
-                buffers.emplace_back(std::move(buffer));
-                pimpl->ctxs_bufs.emplace_back(std::move(ctx), std::move(buffers));
+                pimpl->hadamard_tensors.push_back({ std::move(ctx), buft, true });
                 rotations.push_back({ block_size, buft, rotation });
                 it = std::prev(rotations.end());
             }
@@ -2522,21 +2537,7 @@ void llama_model_base::load_tensors_hadamard() {
                     snprintf(sign_name, sizeof(sign_name), "prism.hadamard.signs.%u", width);
                     ggml_set_name(signs, sign_name);
 
-                    ggml_backend_buffer_ptr buffer { ggml_backend_alloc_ctx_tensors_from_buft(ctx.get(), buft) };
-                    if (!buffer) {
-                        throw std::runtime_error(format("unable to allocate %s Hadamard sign buffer", ggml_backend_buft_name(buft)));
-                    }
-                    ggml_backend_buffer_set_usage(buffer.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
-
-                    std::vector<float> data(width);
-                    for (uint32_t i = 0; i < width; ++i) {
-                        data[i] = (float) sd->second[i];
-                    }
-                    ggml_backend_tensor_set(signs, data.data(), 0, data.size() * sizeof(float));
-
-                    std::vector<ggml_backend_buffer_ptr> buffers;
-                    buffers.emplace_back(std::move(buffer));
-                    pimpl->ctxs_bufs.emplace_back(std::move(ctx), std::move(buffers));
+                    pimpl->hadamard_tensors.push_back({ std::move(ctx), buft, false });
                     st = sign_tensors.emplace(key, signs).first;
                 }
                 sign_tensor = st->second;
@@ -2552,8 +2553,51 @@ void llama_model_base::load_tensors_hadamard() {
         }
     }
 
-    LLAMA_LOG_INFO("%s: loaded %zu Hadamard-folded weight(s) (%zu inverse-lookup) using %zu rotation(s) and %zu sign vector(s)\n",
+    LLAMA_LOG_INFO("%s: created %zu Hadamard-folded weight(s) (%zu inverse-lookup) using %zu rotation(s) and %zu sign vector(s)\n",
             __func__, hdmd.rot.size() + hdmd.inv.size(), hdmd.inv.size(), rotations.size(), sign_tensors.size());
+}
+
+void llama_model_base::load_tensors_hadamard(bool no_alloc) {
+    for (auto & tensor : pimpl->hadamard_tensors) {
+        auto * ctx = tensor.ctx.get();
+        ggml_tensor * t = ggml_get_first_tensor(ctx);
+        ggml_backend_buffer_ptr buffer(no_alloc ? ggml_backend_buft_alloc_buffer(tensor.buft, 0) :
+                ggml_backend_alloc_ctx_tensors_from_buft(ctx, tensor.buft));
+        if (!buffer) {
+            throw std::runtime_error(format("unable to allocate %s Hadamard buffer", ggml_backend_buft_name(tensor.buft)));
+        }
+        ggml_backend_buffer_set_usage(buffer.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+        if (no_alloc) {
+            t->buffer = buffer.get();
+        } else {
+            std::vector<float> data(ggml_nelements(t));
+            if (tensor.rotation) {
+                const uint32_t block_size = (uint32_t) t->ne[0];
+                const float scale = 1.0f / sqrtf((float) block_size);
+                for (uint32_t row = 0; row < block_size; ++row) {
+                    for (uint32_t col = 0; col < block_size; ++col) {
+                        uint32_t parity = row & col;
+                        parity ^= parity >> 16;
+                        parity ^= parity >> 8;
+                        parity ^= parity >> 4;
+                        parity ^= parity >> 2;
+                        parity ^= parity >> 1;
+                        data[(size_t) row * block_size + col] = (parity & 1) ? -scale : scale;
+                    }
+                }
+            } else {
+                const auto & signs = hdmd.sign_data.at((uint32_t) t->ne[0]);
+                for (size_t i = 0; i < data.size(); ++i) {
+                    data[i] = (float) signs[i];
+                }
+            }
+            ggml_backend_tensor_set(t, data.data(), 0, data.size() * sizeof(float));
+        }
+        std::vector<ggml_backend_buffer_ptr> buffers;
+        buffers.emplace_back(std::move(buffer));
+        pimpl->ctxs_bufs.emplace_back(std::move(tensor.ctx), std::move(buffers));
+    }
+    pimpl->hadamard_tensors.clear();
 }
 
 ggml_tensor * llama_model_base::create_tensor(llama_model_loader & ml, const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags) {
