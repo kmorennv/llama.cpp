@@ -22,6 +22,7 @@
 namespace {
 
 thread_local bool preparing = false;
+thread_local ggml_cuda_nvrtc_plan * collecting = nullptr;
 std::atomic<uint64_t> compilation_count{0};
 std::atomic<uint64_t> cache_hit_count{0};
 std::atomic<uint64_t> compiler_time_us{0};
@@ -403,7 +404,21 @@ uint64_t ggml_cuda_nvrtc_cache_hit_count() {
     return cache_hit_count.load(std::memory_order_relaxed);
 }
 
+ggml_cuda_nvrtc_collection::ggml_cuda_nvrtc_collection(ggml_cuda_nvrtc_plan & plan) : previous(collecting) {
+    collecting = &plan;
+}
+
+ggml_cuda_nvrtc_collection::~ggml_cuda_nvrtc_collection() {
+    collecting = previous;
+}
+
 void ggml_cuda_nvrtc_require_shared(int device, const char * header, const std::string & expression, int bytes) {
+    if (collecting) {
+        GGML_ASSERT(collecting->device == device);
+        int & required = collecting->required[kernel_key(header, expression)];
+        required = std::max(required, bytes);
+        return;
+    }
     auto & p = pool();
     std::lock_guard<std::mutex> lock(p.mutex);
     int & required = p.shared[device][kernel_key(header, expression)];
@@ -412,6 +427,19 @@ void ggml_cuda_nvrtc_require_shared(int device, const char * header, const std::
 
 void ggml_cuda_nvrtc_enqueue(int device, const char * header, const std::vector<std::string> & expressions) {
     if (expressions.empty()) {
+        return;
+    }
+    if (collecting) {
+        GGML_ASSERT(collecting->device == device);
+        ggml_cuda_nvrtc_batch batch{header, expressions};
+        std::sort(batch.expressions.begin(), batch.expressions.end());
+        batch.expressions.erase(std::unique(batch.expressions.begin(), batch.expressions.end()), batch.expressions.end());
+        std::string identity = batch.header;
+        for (const auto & expression : batch.expressions) {
+            identity += "\n" + expression;
+            collecting->required.emplace(kernel_key(header, expression), 0);
+        }
+        collecting->batches.emplace(std::move(identity), std::move(batch));
         return;
     }
     const auto target = target_for_device(device);
@@ -450,7 +478,39 @@ void ggml_cuda_nvrtc_enqueue(int device, const char * header, const std::vector<
     p.ready.notify_one();
 }
 
-bool ggml_cuda_nvrtc_wait(int device) {
+void ggml_cuda_nvrtc_submit(ggml_cuda_nvrtc_plan & plan) {
+    std::vector<const ggml_cuda_nvrtc_batch *> batches;
+    for (const auto & entry : plan.batches) {
+        batches.push_back(&entry.second);
+    }
+    std::sort(batches.begin(), batches.end(), [](const ggml_cuda_nvrtc_batch * a, const ggml_cuda_nvrtc_batch * b) {
+        const bool a_fattn = a->header == "fattn-mma-f16.cuh";
+        const bool b_fattn = b->header == "fattn-mma-f16.cuh";
+        if (a_fattn != b_fattn) {
+            return a_fattn;
+        }
+        if (a->header != b->header) {
+            return a->header < b->header;
+        }
+        return a->expressions < b->expressions;
+    });
+    // Register resources before another context can load a shared compilation artifact.
+    for (const auto & entry : plan.required) {
+        const auto split = entry.first.find('\n');
+        ggml_cuda_nvrtc_require_shared(plan.device, entry.first.substr(0, split).c_str(), entry.first.substr(split + 1), entry.second);
+    }
+    for (const auto * batch : batches) {
+        ggml_cuda_nvrtc_enqueue(plan.device, batch->header.c_str(), batch->expressions);
+    }
+    if (verbose()) {
+        GGML_LOG_INFO("NVRTC: submitted %zu groups for %zu context kernel instances on CUDA%d at %.3f s\n",
+            batches.size(), plan.required.size(), plan.device, ggml_time_us() / 1e6);
+    }
+    plan.batches.clear();
+}
+
+bool ggml_cuda_nvrtc_wait(const ggml_cuda_nvrtc_plan & plan) {
+    const int device = plan.device;
     const int64_t wait_start = ggml_time_us();
     try {
         preparing = true;
@@ -458,18 +518,26 @@ bool ggml_cuda_nvrtc_wait(int device) {
         auto & p = pool();
         CUcontext context = nullptr;
         check_driver(cuCtxGetCurrent(&context));
+        if (!context) {
+            // Metadata discovery can reach readiness before the primary CUDA context exists.
+            CUDA_CHECK(cudaFree(nullptr));
+            check_driver(cuCtxGetCurrent(&context));
+            if (!context) {
+                throw std::runtime_error("NVRTC readiness requires a current CUDA context");
+            }
+        }
         size_t ready_count = 0;
         for (;;) {
             std::vector<std::string> pending;
             {
                 std::lock_guard<std::mutex> lock(p.mutex);
-                for (const auto & job : p.required[device]) {
+                for (const auto & job : plan.required) {
                     if (!p.functions[context].count(job.first)) {
                         pending.push_back(job.first);
                     }
                 }
                 if (pending.empty()) {
-                    ready_count = p.required[device].size();
+                    ready_count = plan.required.size();
                     p.prepared.insert(device);
                     break;
                 }

@@ -1010,8 +1010,6 @@ struct llama_model {
     virtual void load_vocab  (llama_model_loader & ml) = 0;
     virtual bool load_tensors(llama_model_loader & ml) = 0; // returns false if cancelled by progress_callback
 
-    virtual bool can_prepare_fattn() const { return false; }
-
     // model must define these
     virtual void load_arch_hparams(llama_model_loader & ml) = 0;
     virtual void load_arch_tensors(llama_model_loader & ml) = 0;
@@ -1070,8 +1068,8 @@ struct llama_model_base : public llama_model {
     // helper: read the prism.hadamard metadata and record which weights are folded
     void load_hparams_hadamard(llama_model_loader & ml);
 
-    // helper: make the prism.hadamard rotation and sign tensors for the folded weights
-    void load_tensors_hadamard();
+    void create_tensors_hadamard();
+    void load_tensors_hadamard(bool no_alloc);
 
     // helper: read the SWA pattern as one flag per layer, or as a period expanded by set_swa_pattern
     void load_swa_pattern(llama_model_loader & ml, uint32_t n_pattern, bool dense_first = false);

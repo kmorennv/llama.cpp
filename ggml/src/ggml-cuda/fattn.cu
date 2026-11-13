@@ -780,10 +780,6 @@ static void ggml_cuda_nvrtc_fattn_mma_prepare(
     ggml_cuda_nvrtc_enqueue(device, "fattn-mma-f16.cuh", main);
 }
 
-void ggml_cuda_nvrtc_fattn_prepare_mma(int device, int DKQ, int DV, bool use_softcap) {
-    ggml_cuda_nvrtc_fattn_mma_prepare(device, DKQ, DV, use_softcap, false, false, nullptr);
-}
-
 void ggml_cuda_nvrtc_fattn_prepare(int device, const ggml_tensor * dst) {
     if (!ggml_cuda_flash_attn_ext_supported(device, dst)) {
         return;

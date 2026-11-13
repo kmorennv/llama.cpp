@@ -2553,7 +2553,6 @@ struct llama_model_qwen3next : public llama_model_base {
 
 struct llama_model_qwen35 : public llama_model_base {
     llama_model_qwen35(const struct llama_model_params & params) : llama_model_base(params) {}
-    bool can_prepare_fattn() const override { return true; }
     void load_arch_hparams(llama_model_loader & ml) override;
     void load_arch_tensors(llama_model_loader & ml) override;
 
@@ -2597,7 +2596,6 @@ struct llama_model_qwen35 : public llama_model_base {
 // Qwen3.5 backbone evaluated without memory, with a joint decision head on top of its hidden states
 struct llama_model_clef : public llama_model_qwen35 {
     llama_model_clef(const struct llama_model_params & params) : llama_model_qwen35(params) {}
-    bool can_prepare_fattn() const override { return false; }
     void load_arch_hparams(llama_model_loader & ml) override;
     void load_arch_tensors(llama_model_loader & ml) override;
 
@@ -2805,7 +2803,6 @@ struct llama_model_qwen4exp : public llama_model_base {
 
 struct llama_model_qwen35moe : public llama_model_base {
     llama_model_qwen35moe(const struct llama_model_params & params) : llama_model_base(params) {}
-    bool can_prepare_fattn() const override { return true; }
     void load_arch_hparams(llama_model_loader & ml) override;
     void load_arch_tensors(llama_model_loader & ml) override;
 

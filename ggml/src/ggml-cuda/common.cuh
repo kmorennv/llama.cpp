@@ -1369,6 +1369,9 @@ struct ggml_tensor_extra_gpu {
 // defined in graph.cuh
 struct ggml_cuda_graph;
 struct ggml_cuda_stream_context;
+#ifdef GGML_CUDA_NVRTC
+struct ggml_cuda_nvrtc_plan;
+#endif
 
 struct ggml_backend_cuda_context {
     int device;
@@ -1386,6 +1389,7 @@ struct ggml_backend_cuda_context {
     int curr_stream_no = 0;
 #ifdef GGML_CUDA_NVRTC
     bool nvrtc_preparing = false;
+    std::unique_ptr<ggml_cuda_nvrtc_plan> nvrtc_plan;
 #endif
 
 #ifdef USE_CUDA_GRAPH
