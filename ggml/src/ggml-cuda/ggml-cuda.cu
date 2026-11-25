@@ -95,6 +95,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <string>
+#include <unordered_set>
 #include <vector>
 
 static_assert(sizeof(half) == sizeof(ggml_fp16_t), "wrong fp16 size");
@@ -5472,23 +5473,85 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
 
 #ifdef GGML_CUDA_NVRTC
     if (cuda_ctx->nvrtc_preparing) {
+        ggml_cuda_set_device(cuda_ctx->device);
         ggml_cuda_nvrtc_collection collection(*cuda_ctx->nvrtc_plan);
+        std::unordered_set<const ggml_tensor *> fusion_inputs;
+        if (!ggml_cuda_fusion_disabled()) {
+            for (int i = 0; i < cgraph->n_nodes; ++i) {
+                const auto * node = cgraph->nodes[i];
+                if (node->op == GGML_OP_GLU || node->op == GGML_OP_ADD || node->op == GGML_OP_ADD_ID || node->op == GGML_OP_MUL) {
+                    for (const auto * input : node->src) {
+                        if (input) {
+                            fusion_inputs.insert(input);
+                        }
+                    }
+                }
+            }
+            for (int i = cgraph->n_nodes - 1; i >= 0; --i) {
+                const auto * node = cgraph->nodes[i];
+                if (fusion_inputs.count(node) && (node->op == GGML_OP_VIEW || node->op == GGML_OP_RESHAPE ||
+                        node->op == GGML_OP_PERMUTE || node->op == GGML_OP_TRANSPOSE || node->op == GGML_OP_GET_ROWS)) {
+                    fusion_inputs.insert(node->src[0]);
+                }
+            }
+        }
         for (int i = 0; i < cgraph->n_nodes; ++i) {
             const ggml_tensor * node = cgraph->nodes[i];
             const ggml_tensor * weight = node->src[0];
             if (!weight) {
                 continue;
             }
+            if (node->op != GGML_OP_MUL_MAT && node->op != GGML_OP_MUL_MAT_ID && node->op != GGML_OP_FLASH_ATTN_EXT) {
+                continue;
+            }
+            if (node->op != GGML_OP_FLASH_ATTN_EXT && !ggml_is_quantized(weight->type)) {
+                ggml_cuda_nvrtc_mmf_prepare(cuda_ctx->device, node);
+                ggml_cuda_nvrtc_mmvf_prepare(cuda_ctx->device, weight, node->op == GGML_OP_MUL_MAT_ID);
+                continue;
+            }
+            const bool fusion = fusion_inputs.count(node) != 0;
+            std::string descriptor;
+            const auto append = [&](const void * data, size_t size) { descriptor.append((const char *) data, size); };
+            append(&node->op, sizeof(node->op));
+            append(node->ne, sizeof(node->ne));
+            append(node->nb, sizeof(node->nb));
+            append(node->op_params, sizeof(node->op_params));
+            append(&fusion, sizeof(fusion));
+            for (const auto * source : node->src) {
+                const bool present = source != nullptr;
+                append(&present, sizeof(present));
+                if (source) {
+                    append(&source->type, sizeof(source->type));
+                    append(source->ne, sizeof(source->ne));
+                    append(source->nb, sizeof(source->nb));
+                    const bool view = source->view_src != nullptr;
+                    append(&view, sizeof(view));
+                }
+            }
+            if (!cuda_ctx->nvrtc_plan->descriptors.insert(std::move(descriptor)).second) {
+                continue;
+            }
             if (node->op == GGML_OP_MUL_MAT || node->op == GGML_OP_MUL_MAT_ID) {
                 if (ggml_is_quantized(weight->type)) {
-                    ggml_cuda_nvrtc_mmq_prepare(cuda_ctx->device, weight->type, weight->ne[0], weight->ne[1]);
-                    ggml_cuda_nvrtc_mmvq_prepare(cuda_ctx->device, weight->type, weight->ne[0], node->op == GGML_OP_MUL_MAT_ID);
-                } else {
-                    ggml_cuda_nvrtc_mmf_prepare(cuda_ctx->device, node);
-                    ggml_cuda_nvrtc_mmvf_prepare(cuda_ctx->device, weight, node->op == GGML_OP_MUL_MAT_ID);
+                    const auto & info = ggml_cuda_info().devices[cuda_ctx->device];
+                    if (!turing_mma_available(info.cc)) {
+                        // Sorted expert fallback uses dense kernels with data-dependent batch sizes.
+                        ggml_cuda_nvrtc_mmq_prepare(cuda_ctx->device, weight->type, weight->ne[0], weight->ne[1]);
+                        ggml_cuda_nvrtc_mmvq_prepare(cuda_ctx->device, weight->type, weight->ne[0], false);
+                        if (node->op == GGML_OP_MUL_MAT_ID) {
+                            ggml_cuda_nvrtc_mmvq_prepare(cuda_ctx->device, weight->type, weight->ne[0], true);
+                        }
+                        continue;
+                    }
+                    // Allocation and batch size can prevent a fusion, so retain its unfused alternative.
+                    ggml_cuda_nvrtc_mmq_prepare(cuda_ctx->device, node, fusion);
+                    const bool moe = node->op == GGML_OP_MUL_MAT_ID;
+                    const int64_t max_columns = moe ? std::min<int64_t>(node->src[1]->ne[2],
+                        get_mmvq_mmid_max_batch(weight->type, info.cc)) : node->src[1]->ne[1];
+                    ggml_cuda_nvrtc_mmvq_prepare(cuda_ctx->device, weight->type, weight->ne[0], moe, max_columns, fusion);
                 }
             } else if (node->op == GGML_OP_FLASH_ATTN_EXT) {
-                ggml_cuda_nvrtc_fattn_prepare(cuda_ctx->device, node);
+                ggml_cuda_nvrtc_fattn_prepare(*cuda_ctx, node);
             }
         }
     }

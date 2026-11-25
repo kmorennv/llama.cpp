@@ -1740,6 +1740,7 @@ bool ggml_cuda_mmq_fusion_is_efficient(ggml_type type, ggml_prec prec_requested,
 
 #ifdef GGML_CUDA_NVRTC
 void ggml_cuda_nvrtc_mmq_prepare(int device, ggml_type type, int64_t ncols_x, int64_t nrows_x);
+void ggml_cuda_nvrtc_mmq_prepare(int device, const ggml_tensor * node, bool fusion);
 #endif
 
 #endif // __CUDACC_RTC__

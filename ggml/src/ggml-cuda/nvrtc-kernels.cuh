@@ -5,6 +5,7 @@
 #if defined(GGML_CUDA_NVRTC) && !defined(__CUDACC_RTC__)
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 struct ggml_cuda_nvrtc_batch {
@@ -16,6 +17,7 @@ struct ggml_cuda_nvrtc_plan {
     int device;
     std::unordered_map<std::string, ggml_cuda_nvrtc_batch> batches;
     std::unordered_map<std::string, int> required;
+    std::unordered_set<std::string> descriptors;
 
     explicit ggml_cuda_nvrtc_plan(int device) : device(device) {}
 };
@@ -31,7 +33,8 @@ public:
     ggml_cuda_nvrtc_collection & operator=(const ggml_cuda_nvrtc_collection &) = delete;
 };
 
-void ggml_cuda_nvrtc_enqueue(int device, const char * header, const std::vector<std::string> & expressions);
+void ggml_cuda_nvrtc_enqueue(int device, const char * header, const std::vector<std::string> & expressions, ggml_type group = GGML_TYPE_COUNT);
+bool ggml_cuda_nvrtc_is_collecting();
 void ggml_cuda_nvrtc_require_shared(int device, const char * header, const std::string & expression, int bytes);
 void ggml_cuda_nvrtc_submit(ggml_cuda_nvrtc_plan & plan);
 bool ggml_cuda_nvrtc_wait(const ggml_cuda_nvrtc_plan & plan);
@@ -48,5 +51,5 @@ static void ggml_cuda_nvrtc_launch(const char * header, const std::string & expr
     ggml_cuda_nvrtc_launch_impl(header, expression, params, max_dynamic_smem, pdl, argv);
 }
 
-void ggml_cuda_nvrtc_mmvq_prepare(int device, ggml_type type, int64_t ncols_x, bool moe);
+void ggml_cuda_nvrtc_mmvq_prepare(int device, ggml_type type, int64_t ncols_x, bool moe, int64_t max_columns = -1, bool fusion = true);
 #endif

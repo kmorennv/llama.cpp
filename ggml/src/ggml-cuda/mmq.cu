@@ -2,6 +2,7 @@
 #include "mmq.cuh"
 #include "quantize.cuh"
 #include "mmid.cuh"
+#include "mmvq.cuh"
 
 #include <cstdint>
 
@@ -289,7 +290,7 @@ void ggml_cuda_nvrtc_mmq_prepare(int device, ggml_type type, int64_t ncols_x, in
         }
     }
     if (!expressions.empty()) {
-        ggml_cuda_nvrtc_enqueue(device, "mmq.cuh", expressions);
+        ggml_cuda_nvrtc_enqueue(device, "mmq.cuh", expressions, type);
     }
 }
 #endif
@@ -323,6 +324,54 @@ static int ggml_cuda_mmq_get_J_best(
     }
     return J_best;
 }
+
+#ifdef GGML_CUDA_NVRTC
+void ggml_cuda_nvrtc_mmq_prepare(int device, const ggml_tensor * node, bool fusion) {
+    const auto * weight = node->src[0];
+    const bool moe = node->op == GGML_OP_MUL_MAT_ID;
+    const int64_t max_columns = node->src[1]->ne[moe ? 2 : 1];
+    const auto & info = ggml_cuda_info().devices[device];
+    const bool fallback = ggml_cuda_mmq_needs_fallback(weight->ne[1]);
+    const auto prec = ggml_cuda_mmq_get_prec_src1(weight->type, ggml_prec_get_src(node, 1), info.cc);
+    std::vector<std::string> expressions;
+    if (max_columns <= 0) {
+        return;
+    }
+    if (max_columns > 2048 || (moe && node->src[2]->ne[0] > INT64_MAX/max_columns)) {
+        GGML_LOG_DEBUG("NVRTC: retain MMQ candidates for a large batch or expert range\n");
+        ggml_cuda_nvrtc_mmq_prepare(device, weight->type, weight->ne[0], weight->ne[1]);
+        return;
+    }
+    const int64_t limit = max_columns;
+    bool selected[16] = {};
+    for (int64_t columns = 1; columns <= limit; ++columns) {
+        const bool vector = moe ? columns <= get_mmvq_mmid_max_batch(weight->type, info.cc) :
+            ggml_cuda_should_use_mmvq(weight->type, info.cc, columns);
+        if (vector || !ggml_cuda_should_use_mmq(weight->type, info.cc, columns, moe ? weight->ne[2] : 0)) {
+            continue;
+        }
+        const int64_t selected_columns = moe ? (columns*node->src[2]->ne[0] + weight->ne[2] - 1)/weight->ne[2] : columns;
+        const int J = ggml_cuda_mmq_get_J_best(weight->type, selected_columns, fallback, info.cc, info.smpbo, prec);
+        if (J == 0 || selected[J/8 - 1]) {
+            continue;
+        }
+        selected[J/8 - 1] = true;
+        const auto config = ggml_cuda_mmq_get_config(weight->type, J, fallback, info.cc, prec);
+        const auto & recipe = mmq_nvrtc_recipe_for(weight->type, J, fallback, prec, false);
+        ggml_cuda_nvrtc_require_shared(device, "mmq.cuh", recipe.main, (int) mmq_get_nbytes_shared(config, info.cc));
+        expressions.push_back(recipe.main);
+        if (config.stream_k) {
+            expressions.push_back(recipe.fixup);
+        }
+        if (fusion && !fallback && ggml_cuda_mmq_fusion_supported(weight->type) && turing_mma_available(info.cc)) {
+            const auto & fused = mmq_nvrtc_recipe_for(weight->type, J, fallback, prec, true);
+            ggml_cuda_nvrtc_require_shared(device, "mmq.cuh", fused.main, (int) mmq_get_nbytes_shared(config, info.cc));
+            expressions.push_back(fused.main);
+        }
+    }
+    ggml_cuda_nvrtc_enqueue(device, "mmq.cuh", expressions, weight->type);
+}
+#endif
 
 void ggml_cuda_mul_mat_q(
         ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst,

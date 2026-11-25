@@ -1136,7 +1136,7 @@ static std::pair<bool, bool> mmvq_ncols1_flags(int cc, int warp_size, int ncols_
 
 #ifdef GGML_CUDA_NVRTC
 template <ggml_type type>
-static void mmvq_prepare_type(int device, int ncols_x, bool moe) {
+static void mmvq_prepare_type(int device, int ncols_x, bool moe, int64_t max_columns, bool fusion) {
     const auto & info = ggml_cuda_info().devices[device];
     const auto flags = mmvq_ncols1_flags<type>(info.cc, info.warp_size, ncols_x, moe);
     constexpr bool promoted = calc_nwarps(type, 1, MMVQ_PARAMETERS_GB10, false, true) !=
@@ -1145,27 +1145,34 @@ static void mmvq_prepare_type(int device, int ncols_x, bool moe) {
     const bool halve_iters = !small_k && flags.second && promoted;
     std::vector<std::string> expressions = {
         ggml_cuda_mmvq_kernel_expression(type, 1, false, small_k, halve_iters),
-        ggml_cuda_mmvq_kernel_expression(type, 1, true,  small_k, halve_iters),
     };
-    if (moe) {
+    if (fusion) {
+        expressions.push_back(ggml_cuda_mmvq_kernel_expression(type, 1, true, small_k, halve_iters));
+    }
+    if (moe && max_columns > 1) {
         expressions.push_back(ggml_cuda_mmvq_moe_kernel_expression(type, false));
-        expressions.push_back(ggml_cuda_mmvq_moe_kernel_expression(type, true));
+        if (fusion) {
+            expressions.push_back(ggml_cuda_mmvq_moe_kernel_expression(type, true));
+        }
     } else {
-        for (int ncols = 2; ncols <= MMVQ_MAX_BATCH_SIZE; ++ncols) {
+        for (int ncols = 2; ncols <= std::min<int64_t>(max_columns, MMVQ_MAX_BATCH_SIZE); ++ncols) {
             if (ggml_cuda_should_use_mmvq(type, info.cc, ncols)) {
                 expressions.push_back(ggml_cuda_mmvq_kernel_expression(type, ncols, false, false, false));
             }
         }
     }
-    ggml_cuda_nvrtc_enqueue(device, "mmvq.cu", expressions);
+    ggml_cuda_nvrtc_enqueue(device, "mmvq.cu", expressions, type);
 }
 
-void ggml_cuda_nvrtc_mmvq_prepare(int device, ggml_type type, int64_t ncols_x, bool moe) {
+void ggml_cuda_nvrtc_mmvq_prepare(int device, ggml_type type, int64_t ncols_x, bool moe, int64_t max_columns, bool fusion) {
     if (ncols_x <= 0 || ncols_x > INT32_MAX || ncols_x % ggml_blck_size(type) != 0) {
         return;
     }
+    if (max_columns < 0) {
+        max_columns = MMVQ_MAX_BATCH_SIZE;
+    }
     switch (type) {
-#define PREPARE_TYPE(TYPE) case TYPE: mmvq_prepare_type<TYPE>(device, (int) ncols_x, moe); break
+#define PREPARE_TYPE(TYPE) case TYPE: mmvq_prepare_type<TYPE>(device, (int) ncols_x, moe, max_columns, fusion); break
         PREPARE_TYPE(GGML_TYPE_Q1_0);
         PREPARE_TYPE(GGML_TYPE_Q2_0);
         PREPARE_TYPE(GGML_TYPE_Q4_0);

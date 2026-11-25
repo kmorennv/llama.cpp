@@ -37,6 +37,12 @@ const std::string & fattn_nvrtc_expression_cached(const char * name, const int *
     return result->second;
 }
 
+static bool fattn_should_scan_mask(const ggml_tensor * dst, int64_t n_kv_cols, bool use_sparse) {
+    const auto * Q = dst->src[0];
+    return !use_sparse && dst->src[3] && n_kv_cols % FATTN_KQ_STRIDE == 0 &&
+        (Q->ne[1] >= 1024 || Q->ne[3] > 1 || dst->src[5]);
+}
+
 void launch_fattn_nvrtc(int DV, int ncols1, int ncols2,
     ggml_backend_cuda_context & ctx, ggml_tensor * dst, fattn_kernel_t fattn_kernel, const int nwarps, const size_t nbytes_shared,
     const int nbatch_fa, const bool need_f16_K, const bool need_f16_V, const bool stream_k, const bool use_sparse,
@@ -57,6 +63,29 @@ void launch_fattn_nvrtc(int DV, int ncols1, int ncols2,
     // with kv_rows the kernel iterates over the mask columns and reads K/V rows through kv_rows
     const int64_t n_kv_cols = kv_rows ? kv_rows->ne[0] : K->ne[1];
     GGML_ASSERT(!kv_rows || !use_sparse);
+
+    if (ggml_cuda_nvrtc_is_collecting()) {
+        ggml_cuda_nvrtc_require_shared(ctx.device, fattn_kernel.header, fattn_kernel.expression, (int) nbytes_shared);
+        ggml_cuda_nvrtc_enqueue(ctx.device, fattn_kernel.header, { fattn_kernel.expression });
+        std::vector<std::string> common;
+        if (stream_k) {
+            // Occupancy determines the fixup at launch; retain both small helper variants.
+            common.push_back(fattn_nvrtc_expression("flash_attn_stream_k_fixup_uniform", DV, ncols1, ncols2));
+            common.push_back(fattn_nvrtc_expression("flash_attn_stream_k_fixup_general", DV, ncols1, ncols2));
+        } else if (n_kv_cols > nbatch_fa) {
+            common.push_back(fattn_nvrtc_expression("flash_attn_combine_results", DV));
+        }
+        if (fattn_should_scan_mask(dst, n_kv_cols, use_sparse)) {
+            common.push_back(fattn_nvrtc_expression("flash_attn_mask_to_KV_max", ncols1));
+        }
+        if (use_sparse) {
+            ggml_cuda_nvrtc_enqueue(ctx.device, "fattn-mask.cuh", {
+                fattn_nvrtc_expression("flash_attn_mask_to_sparse_indices", ncols1, Q->ne[1] % ncols1 != 0),
+            });
+        }
+        ggml_cuda_nvrtc_enqueue(ctx.device, "fattn-common.cuh", common);
+        return;
+    }
 
     ggml_tensor * KQV = dst;
 
@@ -178,7 +207,7 @@ void launch_fattn_nvrtc(int DV, int ncols1, int ncols2,
     // Optional optimization where the mask is scanned to determine whether part of the calculation can be skipped.
     // Only worth the overhead if there is at lease one FATTN_KQ_STRIDE x FATTN_KQ_STRIDE square to be skipped or
     //     multiple sequences of possibly different lengths, or kv_rows lists that end with padding.
-    const bool scan_mask = !use_sparse && mask && n_kv_cols % FATTN_KQ_STRIDE == 0 && (Q->ne[1] >= 1024 || Q->ne[3] > 1 || kv_rows);
+    const bool scan_mask = fattn_should_scan_mask(dst, n_kv_cols, use_sparse);
     if (scan_mask) {
         const int64_t s31 = mask->nb[1] / sizeof(half2);
         const int64_t s33 = mask->nb[3] / sizeof(half2);

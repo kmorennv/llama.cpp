@@ -7,5 +7,5 @@ bool ggml_cuda_flash_attn_ext_supported(int device, const ggml_tensor * dst);
 size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * dst);
 
 #ifdef GGML_CUDA_NVRTC
-void ggml_cuda_nvrtc_fattn_prepare(int device, const ggml_tensor * dst);
+void ggml_cuda_nvrtc_fattn_prepare(ggml_backend_cuda_context & ctx, const ggml_tensor * dst);
 #endif

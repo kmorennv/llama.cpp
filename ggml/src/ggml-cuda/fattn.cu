@@ -780,7 +780,7 @@ static void ggml_cuda_nvrtc_fattn_mma_prepare(
     ggml_cuda_nvrtc_enqueue(device, "fattn-mma-f16.cuh", main);
 }
 
-void ggml_cuda_nvrtc_fattn_prepare(int device, const ggml_tensor * dst) {
+static void ggml_cuda_nvrtc_fattn_prepare_all(int device, const ggml_tensor * dst) {
     if (!ggml_cuda_flash_attn_ext_supported(device, dst)) {
         return;
     }
@@ -845,4 +845,79 @@ void ggml_cuda_nvrtc_fattn_prepare(int device, const ggml_tensor * dst) {
         });
     }
 }
+
+void ggml_cuda_nvrtc_fattn_prepare(ggml_backend_cuda_context & ctx, const ggml_tensor * dst) {
+    GGML_ASSERT(ggml_cuda_nvrtc_is_collecting());
+    const int64_t max_queries = dst->src[0]->ne[1];
+    const int64_t max_kv = dst->src[5] ? dst->src[5]->ne[0] : dst->src[1]->ne[1];
+    bool uncertain_layout = max_kv % FATTN_KQ_STRIDE != 0;
+    for (const auto * tensor : { dst->src[0], dst->src[1], dst->src[2], dst->src[3] }) {
+        if (tensor && !ggml_is_quantized(tensor->type)) {
+            for (int i = 1; i < GGML_MAX_DIMS; ++i) {
+                uncertain_layout |= tensor->nb[i] % 16 != 0;
+            }
+        }
+    }
+    if (max_kv > 65536 || uncertain_layout) {
+        GGML_LOG_DEBUG("NVRTC: retain FlashAttention candidates for a large or unaligned KV layout\n");
+        ggml_cuda_nvrtc_fattn_prepare_all(ctx.device, dst);
+        return;
+    }
+    std::vector<int64_t> kv_lengths = { max_kv };
+    for (int64_t edge = 0; edge <= max_kv; edge += FATTN_KQ_STRIDE) {
+        for (int delta : { -1, 0, 1 }) {
+            if (edge + delta > 0 && edge + delta <= max_kv) {
+                kv_lengths.push_back(edge + delta);
+            }
+        }
+    }
+    std::sort(kv_lengths.begin(), kv_lengths.end());
+    kv_lengths.erase(std::unique(kv_lengths.begin(), kv_lengths.end()), kv_lengths.end());
+    std::vector<int64_t> queries;
+    for (int64_t n = 1; n <= std::min<int64_t>(max_queries, 64); ++n) {
+        queries.push_back(n);
+    }
+    if (max_queries > 64) {
+        queries.push_back(max_queries);
+    }
+    // Kernel tiles saturate at 64 queries; KV padding edges also cover GQA and sparse transitions.
+    for (int64_t n : queries) {
+        for (int64_t kv : kv_lengths) {
+            for (bool single_sequence : { false, true }) {
+                if (single_sequence && dst->src[0]->ne[3] == 1) {
+                    continue;
+                }
+                ggml_tensor node = *dst;
+                ggml_tensor q = *dst->src[0];
+                ggml_tensor k = *dst->src[1];
+                ggml_tensor v = *dst->src[2];
+                ggml_tensor mask = {};
+                ggml_tensor rows = {};
+                q.ne[1] = n;
+                q.ne[3] = single_sequence ? 1 : q.ne[3];
+                if (dst->src[5]) {
+                    rows = *dst->src[5];
+                    rows.ne[0] = kv;
+                    node.src[5] = &rows;
+                } else {
+                    k.ne[1] = v.ne[1] = kv;
+                }
+                node.src[0] = &q;
+                node.src[1] = &k;
+                node.src[2] = &v;
+                if (dst->src[3]) {
+                    mask = *dst->src[3];
+                    if (mask.ne[0] == dst->src[1]->ne[1]) {
+                        mask.ne[0] = k.ne[1];
+                    }
+                    node.src[3] = &mask;
+                }
+                if (ggml_cuda_flash_attn_ext_supported(ctx.device, &node)) {
+                    ggml_cuda_flash_attn_ext(ctx, &node);
+                }
+            }
+        }
+    }
+}
+
 #endif

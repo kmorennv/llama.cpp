@@ -28,7 +28,7 @@ static bool compare_output(int, ggml_tensor * actual, ggml_tensor * expected, vo
     return ok;
 }
 
-static bool run_case(ggml_backend_t backend, ggml_backend_t reference, ggml_type type, int64_t rows, int64_t columns, bool moe = false, int64_t k = 256, bool f32_acc = false) {
+static bool run_case(ggml_backend_t backend, ggml_backend_t reference, ggml_type type, int64_t rows, int64_t columns, bool moe = false, int64_t k = 256, bool f32_acc = false, bool fused = false) {
     const int64_t experts = moe ? 3 : 1;
     const ggml_init_params params = { ggml_tensor_overhead()*8 + ggml_graph_overhead(), nullptr, true };
     ggml_context_ptr ctx(ggml_init(params));
@@ -40,6 +40,12 @@ static bool run_case(ggml_backend_t backend, ggml_backend_t reference, ggml_type
         ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F32, k, columns);
     ggml_tensor * ids = moe ? ggml_new_tensor_2d(ctx.get(), GGML_TYPE_I32, 2, columns) : nullptr;
     ggml_tensor * output = moe ? ggml_mul_mat_id(ctx.get(), weights, input, ids) : ggml_mul_mat(ctx.get(), weights, input);
+    ggml_tensor * gate_weights = nullptr;
+    if (fused) {
+        gate_weights = ggml_dup_tensor(ctx.get(), weights);
+        ggml_tensor * gate = moe ? ggml_mul_mat_id(ctx.get(), gate_weights, input, ids) : ggml_mul_mat(ctx.get(), gate_weights, input);
+        output = ggml_swiglu_split(ctx.get(), gate, output);
+    }
     if (f32_acc) {
         ggml_prec_set_acc(output, GGML_PREC_F32);
     }
@@ -63,6 +69,9 @@ static bool run_case(ggml_backend_t backend, ggml_backend_t reference, ggml_type
         return false;
     }
     ggml_backend_tensor_set(weights, quantized.data(), 0, quantized.size());
+    if (gate_weights) {
+        ggml_backend_tensor_set(gate_weights, quantized.data(), 0, quantized.size());
+    }
     ggml_backend_tensor_set(input, input_values.data(), 0, input_values.size()*sizeof(float));
     if (ids) {
         std::vector<int32_t> selected(2*columns);
@@ -79,22 +88,22 @@ static bool run_case(ggml_backend_t backend, ggml_backend_t reference, ggml_type
             return false;
         }
     }
-    printf("prepared %s %s: rows=%lld columns=%lld K=%lld acc=%s %s\n", ggml_type_name(type), moe ? "MoE" : "matmul",
-        (long long) rows, (long long) columns, (long long) k, f32_acc ? "F32" : "default", ok ? "OK" : "FAIL");
+    printf("prepared %s %s: rows=%lld columns=%lld K=%lld acc=%s fused=%d %s\n", ggml_type_name(type), moe ? "MoE" : "matmul",
+        (long long) rows, (long long) columns, (long long) k, f32_acc ? "F32" : "default", fused, ok ? "OK" : "FAIL");
     return ok;
 }
 
-static ggml_tensor * build_auxiliary_graph(ggml_context * ctx, bool attention, int64_t columns, bool softcap = false) {
+static ggml_tensor * build_auxiliary_graph(ggml_context * ctx, bool attention, int64_t columns, bool softcap = false, int64_t head_size = 0, int64_t kv_length = 128, int64_t gqa = 1, bool masked = true, int64_t sequences = 1) {
     if (!attention) {
         ggml_tensor * weights = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, 256, 128);
         ggml_tensor * input = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 256, columns);
         return ggml_mul_mat(ctx, weights, input);
     }
-    const int64_t head_size = softcap ? 128 : 64;
-    ggml_tensor * q = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, head_size, columns, 2, 1);
-    ggml_tensor * k = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, head_size, 128, 2, 1);
-    ggml_tensor * v = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, head_size, 128, 2, 1);
-    ggml_tensor * mask = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, 128, columns);
+    head_size = head_size ? head_size : (softcap ? 128 : 64);
+    ggml_tensor * q = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, head_size, columns, 2*gqa, sequences);
+    ggml_tensor * k = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, head_size, kv_length, 2, sequences);
+    ggml_tensor * v = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, head_size, kv_length, 2, sequences);
+    ggml_tensor * mask = masked ? ggml_new_tensor_2d(ctx, GGML_TYPE_F16, kv_length, columns) : nullptr;
     ggml_tensor * output = ggml_flash_attn_ext(ctx, q, k, v, mask, 1.0f/sqrtf((float) head_size), 0.0f, softcap ? 1.0f : 0.0f);
     ggml_prec_set_acc(output, GGML_PREC_F32);
     return output;
@@ -102,21 +111,27 @@ static ggml_tensor * build_auxiliary_graph(ggml_context * ctx, bool attention, i
 
 static bool prepare_graph(ggml_backend_t backend, ggml_backend_t reference, ggml_context * ctx, ggml_tensor * output, bool static_weight = false) {
     ggml_backend_buffer_ptr weights;
+    std::vector<ggml_tensor *> bound_weights;
     if (static_weight) {
         weights.reset(ggml_backend_buft_alloc_buffer(ggml_backend_get_default_buffer_type(backend), 0));
         if (!weights) {
             return false;
         }
         ggml_backend_buffer_set_usage(weights.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
-        output->src[0]->buffer = weights.get();
+        for (auto * tensor = ggml_get_first_tensor(ctx); tensor; tensor = ggml_get_next_tensor(ctx, tensor)) {
+            if (tensor->op == GGML_OP_NONE && ggml_is_quantized(tensor->type)) {
+                tensor->buffer = weights.get();
+                bound_weights.push_back(tensor);
+            }
+        }
     }
     ggml_cgraph * graph = ggml_new_graph(ctx);
     ggml_build_forward_expand(graph, output);
     ggml_backend_t backends[] = { backend, reference };
     ggml_backend_sched_ptr scheduler(ggml_backend_sched_new(backends, nullptr, 2, GGML_DEFAULT_GRAPH_SIZE, false, true));
     if (!scheduler || !ggml_backend_supports_op(backend, output)) {
-        if (static_weight) {
-            output->src[0]->buffer = nullptr;
+        for (auto * tensor : bound_weights) {
+            tensor->buffer = nullptr;
         }
         return false;
     }
@@ -124,17 +139,17 @@ static bool prepare_graph(ggml_backend_t backend, ggml_backend_t reference, ggml
     ggml_backend_sched_split_graph(scheduler.get(), graph);
     const bool no_allocation = ggml_backend_sched_get_buffer_size(scheduler.get(), backend) == 0;
     scheduler.reset();
-    if (static_weight) {
-        output->src[0]->buffer = nullptr;
+    for (auto * tensor : bound_weights) {
+        tensor->buffer = nullptr;
     }
     return no_allocation;
 }
 
-static bool prepare_quant_graphs(ggml_backend_t backend, ggml_backend_t reference, const std::vector<ggml_type> & types) {
+static bool prepare_quant_graphs(ggml_backend_t backend, ggml_backend_t reference, const std::vector<ggml_type> & types, int64_t max_columns = 129) {
     for (ggml_type type : types) {
         for (int64_t rows : { 128, 130 }) {
             for (bool moe : { false, true }) {
-                if (moe && (type != GGML_TYPE_Q4_K || rows != 128)) {
+                if (moe && ((type != GGML_TYPE_Q4_K && type != GGML_TYPE_NVFP4 && type != GGML_TYPE_MXFP4) || rows != 128)) {
                     continue;
                 }
                 const ggml_init_params params = { ggml_tensor_overhead()*8 + ggml_graph_overhead(), nullptr, true };
@@ -143,10 +158,15 @@ static bool prepare_quant_graphs(ggml_backend_t backend, ggml_backend_t referenc
                     return false;
                 }
                 ggml_tensor * weights = ggml_new_tensor_3d(ctx.get(), type, 256, rows, moe ? 3 : 1);
-                ggml_tensor * input = moe ? ggml_new_tensor_3d(ctx.get(), GGML_TYPE_F32, 256, 2, 7) :
-                    ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F32, 256, 32);
-                ggml_tensor * ids = moe ? ggml_new_tensor_2d(ctx.get(), GGML_TYPE_I32, 2, 7) : nullptr;
+                ggml_tensor * input = moe ? ggml_new_tensor_3d(ctx.get(), GGML_TYPE_F32, 256, 2, max_columns) :
+                    ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F32, 256, max_columns);
+                ggml_tensor * ids = moe ? ggml_new_tensor_2d(ctx.get(), GGML_TYPE_I32, 2, max_columns) : nullptr;
                 ggml_tensor * output = moe ? ggml_mul_mat_id(ctx.get(), weights, input, ids) : ggml_mul_mat(ctx.get(), weights, input);
+                if (rows == 128) {
+                    ggml_tensor * gate_weights = ggml_dup_tensor(ctx.get(), weights);
+                    ggml_tensor * gate = moe ? ggml_mul_mat_id(ctx.get(), gate_weights, input, ids) : ggml_mul_mat(ctx.get(), gate_weights, input);
+                    output = ggml_swiglu_split(ctx.get(), gate, output);
+                }
                 if (!prepare_graph(backend, reference, ctx.get(), output, true)) {
                     return false;
                 }
@@ -164,6 +184,16 @@ static bool prepare_auxiliary_graphs(ggml_backend_t backend, ggml_backend_t refe
         ggml_context_ptr ctx(ggml_init(params));
         if (!ctx || !prepare_graph(backend, reference, ctx.get(), build_auxiliary_graph(ctx.get(), attention, 16, softcap))) {
             return false;
+        }
+    }
+    for (int64_t head_size : { 64, 128, 256 }) {
+        for (bool masked : { false, true }) {
+            const ggml_init_params params = { ggml_tensor_overhead()*8 + ggml_graph_overhead(), nullptr, true };
+            ggml_context_ptr ctx(ggml_init(params));
+            if (!ctx || !prepare_graph(backend, reference, ctx.get(),
+                    build_auxiliary_graph(ctx.get(), true, 1024, head_size == 128, head_size, 1024, head_size == 256 ? 6 : 1, masked, head_size == 64 && masked ? 3 : 1))) {
+                return false;
+            }
         }
     }
     return true;
@@ -189,13 +219,13 @@ static bool prepare_float_graphs(ggml_backend_t backend, ggml_backend_t referenc
     return true;
 }
 
-static bool run_auxiliary_case(ggml_backend_t backend, ggml_backend_t reference, bool attention, int64_t columns, bool softcap = false) {
+static bool run_auxiliary_case(ggml_backend_t backend, ggml_backend_t reference, bool attention, int64_t columns, bool softcap = false, int64_t head_size = 0, int64_t kv_length = 128, int64_t gqa = 1, bool masked = true, int64_t sequences = 1) {
     const ggml_init_params params = { ggml_tensor_overhead()*8 + ggml_graph_overhead(), nullptr, true };
     ggml_context_ptr ctx(ggml_init(params));
     if (!ctx) {
         return false;
     }
-    ggml_tensor * output = build_auxiliary_graph(ctx.get(), attention, columns, softcap);
+    ggml_tensor * output = build_auxiliary_graph(ctx.get(), attention, columns, softcap, head_size, kv_length, gqa, masked, sequences);
     ggml_cgraph * graph = ggml_new_graph(ctx.get());
     ggml_build_forward_expand(graph, output);
     ggml_backend_buffer_ptr buffer(ggml_backend_alloc_ctx_tensors(ctx.get(), backend));
@@ -228,14 +258,14 @@ static bool run_auxiliary_case(ggml_backend_t backend, ggml_backend_t reference,
     return ok;
 }
 
-static bool reject_unprepared_graph(ggml_backend_t backend) {
+static bool reject_unprepared_graph(ggml_backend_t backend, int64_t columns = 1) {
     const ggml_init_params params = { ggml_tensor_overhead()*4 + ggml_graph_overhead(), nullptr, true };
     ggml_context_ptr ctx(ggml_init(params));
     if (!ctx) {
         return false;
     }
     ggml_tensor * weights = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_Q2_K, 256, 128);
-    ggml_tensor * input = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F32, 256, 1);
+    ggml_tensor * input = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F32, 256, columns);
     ggml_tensor * output = ggml_mul_mat(ctx.get(), weights, input);
     ggml_cgraph * graph = ggml_new_graph(ctx.get());
     ggml_build_forward_expand(graph, output);
@@ -276,11 +306,26 @@ int main() {
         const std::vector<ggml_type> quant_types = {
             GGML_TYPE_Q3_K, GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K,
             GGML_TYPE_Q8_0, GGML_TYPE_IQ4_XS, GGML_TYPE_IQ4_NL, GGML_TYPE_IQ3_S,
+            GGML_TYPE_NVFP4, GGML_TYPE_MXFP4,
         };
         ggml_backend_ptr backend(ggml_backend_dev_init(device, nullptr));
         ggml_backend_ptr reference(ggml_backend_init_by_name("CPU", nullptr));
         if (!backend || !reference) {
             return 1;
+        }
+        {
+            const ggml_init_params params = { ggml_tensor_overhead()*8 + ggml_graph_overhead(), nullptr, true };
+            ggml_context_ptr ctx(ggml_init(params));
+            prepare_begin(backend.get());
+            if (!ctx || !prepare_graph(backend.get(), reference.get(), ctx.get(),
+                    build_auxiliary_graph(ctx.get(), true, 32, false, 128, 257, 4)) || !prepare_wait(backend.get())) {
+                return 1;
+            }
+            for (int64_t columns : { 2, 17 }) {
+                if (!run_auxiliary_case(backend.get(), reference.get(), true, columns, false, 128, 256, 4)) {
+                    return 1;
+                }
+            }
         }
         {
             ggml_backend_ptr discovery(ggml_backend_dev_init(device, nullptr));
@@ -325,16 +370,26 @@ int main() {
         // No preparation below: every decode, prefill and tail variant must already be loaded.
         for (ggml_type type : quant_types) {
             for (int64_t rows : { 128, 130 }) {
-                for (int64_t columns : { 1, 7, 32, 129 }) {
+                for (int64_t columns : { 1, 2, 7, 8, 9, 15, 16, 17, 31, 32, 33, 63, 64, 65, 95, 96, 97, 127, 128, 129 }) {
                     if (!run_case(backend.get(), reference.get(), type, rows, columns)) {
                         return 1;
                     }
                 }
             }
         }
-        for (int64_t columns : { 1, 7, 32 }) {
+        for (int64_t columns : { 1, 2, 7, 8, 9, 32, 129 }) {
             if (!run_case(backend.get(), reference.get(), GGML_TYPE_Q4_K, 128, columns, true)) {
                 return 1;
+            }
+        }
+        for (ggml_type type : { GGML_TYPE_Q4_K, GGML_TYPE_Q8_0, GGML_TYPE_NVFP4, GGML_TYPE_MXFP4 }) {
+            for (bool moe : { false, true }) {
+                if (moe && type == GGML_TYPE_Q8_0) { continue; }
+                for (int64_t columns : { 1, 2, 7, 8, 9, 32, 129 }) {
+                    if (!run_case(backend.get(), reference.get(), type, 128, columns, moe, 256, false, true)) {
+                        return 1;
+                    }
+                }
             }
         }
         for (bool attention : { false, true }) {
@@ -348,6 +403,32 @@ int main() {
             if (!run_auxiliary_case(backend.get(), reference.get(), true, columns, true)) {
                 return 1;
             }
+        }
+        for (int64_t head_size : { 64, 128, 256 }) {
+            for (bool masked : { false, true }) {
+                for (int64_t columns : { 1, 2, 3, 7, 8, 9, 16, 17, 32, 33, 64, 65 }) {
+                    if (!run_auxiliary_case(backend.get(), reference.get(), true, columns, head_size == 128,
+                            head_size, 512, head_size == 256 ? 6 : 1, masked)) {
+                        return 1;
+                    }
+                }
+                for (int64_t kv_length : { 255, 256, 257, 511, 512, 1024 }) {
+                    if (!run_auxiliary_case(backend.get(), reference.get(), true, 1, head_size == 128,
+                            head_size, kv_length, head_size == 256 ? 6 : 1, masked)) {
+                        return 1;
+                    }
+                }
+            }
+        }
+        for (int64_t sequences : { 2, 3 }) {
+            for (int64_t columns : { 1, 2, 3, 8, 9, 16, 17, 33, 65 }) {
+                if (!run_auxiliary_case(backend.get(), reference.get(), true, columns, false, 64, 512, 1, true, sequences)) {
+                    return 1;
+                }
+            }
+        }
+        if (!run_auxiliary_case(backend.get(), reference.get(), true, 1024, false, 64, 1024)) {
+            return 1;
         }
         for (ggml_type type : { GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_BF16, GGML_TYPE_F8_E4M3 }) {
             for (int64_t columns = 1; columns <= 8; ++columns) {
@@ -376,7 +457,7 @@ int main() {
                 return 1;
             }
             prepare_begin(discovery.get());
-            if (!prepare_quant_graphs(discovery.get(), reference.get(), { GGML_TYPE_Q2_K }) || !prepare_submit(discovery.get())) {
+            if (!prepare_quant_graphs(discovery.get(), reference.get(), { GGML_TYPE_Q2_K }, 1) || !prepare_submit(discovery.get())) {
                 return 1;
             }
         }
@@ -384,8 +465,17 @@ int main() {
             return 1;
         }
         prepare_begin(backend.get());
-        if (!prepare_quant_graphs(backend.get(), reference.get(), { GGML_TYPE_Q2_K }) || !prepare_wait(backend.get()) ||
+        if (!prepare_quant_graphs(backend.get(), reference.get(), { GGML_TYPE_Q2_K }, 1) || !prepare_wait(backend.get()) ||
                 !run_case(backend.get(), reference.get(), GGML_TYPE_Q2_K, 128, 1)) {
+            return 1;
+        }
+        if (!reject_unprepared_graph(backend.get(), 7)) {
+            fprintf(stderr, "NVRTC prepared a batch outside the discovered range\n");
+            return 1;
+        }
+        prepare_begin(backend.get());
+        if (!prepare_quant_graphs(backend.get(), reference.get(), { GGML_TYPE_Q2_K }) || !prepare_wait(backend.get()) ||
+                !run_case(backend.get(), reference.get(), GGML_TYPE_Q2_K, 128, 7)) {
             return 1;
         }
 

@@ -442,12 +442,29 @@ void ggml_cuda_nvrtc_require_shared(int device, const char * header, const std::
     required = std::max(required, bytes);
 }
 
-void ggml_cuda_nvrtc_enqueue(int device, const char * header, const std::vector<std::string> & expressions) {
+bool ggml_cuda_nvrtc_is_collecting() {
+    return collecting != nullptr;
+}
+
+void ggml_cuda_nvrtc_enqueue(int device, const char * header, const std::vector<std::string> & expressions, ggml_type group) {
     if (expressions.empty()) {
         return;
     }
     if (collecting) {
         GGML_ASSERT(collecting->device == device);
+        if (group != GGML_TYPE_COUNT || strncmp(header, "fattn-", 6) == 0) {
+            const std::string identity = std::string(header) + "\n" + std::to_string(group);
+            auto & batch = collecting->batches[identity];
+            batch.header = header;
+            for (const auto & expression : expressions) {
+                collecting->required.emplace(kernel_key(header, expression), 0);
+                const auto position = std::lower_bound(batch.expressions.begin(), batch.expressions.end(), expression);
+                if (position == batch.expressions.end() || *position != expression) {
+                    batch.expressions.insert(position, expression);
+                }
+            }
+            return;
+        }
         ggml_cuda_nvrtc_batch batch{header, expressions};
         std::sort(batch.expressions.begin(), batch.expressions.end());
         batch.expressions.erase(std::unique(batch.expressions.begin(), batch.expressions.end()), batch.expressions.end());
